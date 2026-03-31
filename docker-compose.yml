@@ -1,16 +1,36 @@
 services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+    command: ["--model", "${VLLM_MODEL:-Qwen/Qwen3-8B}", "--dtype", "auto", "--gpu-memory-utilization", "0.55"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped
+
   chroma:
     image: chromadb/chroma:0.6.3
     ports:
-      - "${CHROMA_PORT:-8009}:8009"
+      - "${CHROMA_PORT:-8010}:8000"
     volumes:
       - chroma_data:/chroma/chroma
     environment:
       ANONYMIZED_TELEMETRY: "false"
-      CHROMA_SERVER_HTTP_PORT: "8009"
     restart: unless-stopped
 
 volumes:
+  huggingface_cache:
+    # Persists downloaded model weights across container restarts.
   chroma_data:
     # Named volume — data survives container restarts and re-creates.
     # To wipe all indexed audio: docker compose down -v

@@ -42,6 +42,36 @@ def embed_chunks(
     collection.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
 
 
+def store_summary(
+    summary: str,
+    collection: chromadb.Collection,
+    embedding_model: SentenceTransformer,
+    audio_filename: str,
+) -> None:
+    """Embed and upsert the summary as a special document for direct lookup."""
+    embedding = embedding_model.encode(summary, show_progress_bar=False).tolist()
+    collection.upsert(
+        ids=[f"{audio_filename}_summary"],
+        embeddings=[embedding],
+        documents=[summary],
+        metadatas=[{
+            "type": "summary",
+            "audio_file": audio_filename,
+            "speaker": "",
+            "start": 0.0,
+            "end": 0.0,
+        }],
+    )
+
+
+def get_summary(collection: chromadb.Collection, audio_filename: str) -> str | None:
+    """Retrieve a previously stored summary for an audio file. Returns None if missing."""
+    result = collection.get(ids=[f"{audio_filename}_summary"])
+    if result["documents"]:
+        return result["documents"][0]
+    return None
+
+
 def clear_collection(collection: chromadb.Collection) -> None:
     """Delete all documents from the collection (called explicitly, never automatically)."""
     existing = collection.get()

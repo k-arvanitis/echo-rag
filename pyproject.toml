@@ -27,8 +27,8 @@ dependencies = [
     "numpy>=1.26.0",
     "datasets>=3.1.0",
     # PyTorch — installed via the pytorch index below (see [tool.uv.sources])
-    "torch==2.4.0",
-    "torchaudio==2.4.0",
+    "torch>=2.6.0",
+    "torchaudio>=2.6.0",
 ]
 
 [project.scripts]
@@ -39,11 +39,21 @@ echo-rag = "run_pipeline:main"
 # uv: route torch/torchaudio to the PyTorch CUDA index.
 # Change cu121 → cu118 or cpu to match your hardware.
 # ---------------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pipeline*"]
+
+[tool.uv]
+package = true
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
-torchaudio = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true

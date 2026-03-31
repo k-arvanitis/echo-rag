@@ -1,39 +1,54 @@
-"""Sliding-window chunking over complete speaker turns.
+"""Character-budget chunking over complete speaker turns.
 
-Chunk boundaries always fall at speaker-change points — a turn is never split.
-Each chunk covers CHUNK_WINDOW_TURNS consecutive turns, advancing CHUNK_STRIDE_TURNS
-at a time so adjacent chunks overlap and no exchange falls in a gap.
+Turns are accumulated until the chunk reaches CHUNK_MAX_CHARS characters.
+A turn is never split — if a single turn exceeds the budget it becomes its own chunk.
 """
-from config import CHUNK_STRIDE_TURNS, CHUNK_WINDOW_TURNS
+from config import CHUNK_MAX_CHARS
 
 
 def _format_turns(turns: list[dict]) -> str:
-    """Format a window of turns as labelled dialogue."""
     return "\n".join(f"[{t['speaker']}]: {t['text']}" for t in turns)
 
 
 def chunk_transcript(
     segments: list[dict],
-    window: int = CHUNK_WINDOW_TURNS,
-    stride: int = CHUNK_STRIDE_TURNS,
+    max_chars: int = CHUNK_MAX_CHARS,
 ) -> list[dict]:
-    """Slide a window of `window` turns over the transcript, stepping by `stride`.
+    """Group speaker turns into chunks up to `max_chars` characters.
 
     Returns list of {text, speaker, start, end}.
-    `speaker` lists all speakers present in the window (comma-separated).
+    `speaker` lists all speakers present in the chunk (comma-separated).
     """
     chunks = []
-    for i in range(0, len(segments), stride):
-        turns = segments[i : i + window]
-        if not turns:
-            break
-        speakers = list(dict.fromkeys(t["speaker"] for t in turns))
+    current: list[dict] = []
+    current_chars = 0
+
+    for turn in segments:
+        turn_len = len(turn["text"])
+        if current and current_chars + turn_len > max_chars:
+            speakers = list(dict.fromkeys(t["speaker"] for t in current))
+            chunks.append(
+                {
+                    "text": _format_turns(current),
+                    "speaker": ", ".join(speakers),
+                    "start": current[0]["start"],
+                    "end": current[-1]["end"],
+                }
+            )
+            current = []
+            current_chars = 0
+        current.append(turn)
+        current_chars += turn_len
+
+    if current:
+        speakers = list(dict.fromkeys(t["speaker"] for t in current))
         chunks.append(
             {
-                "text": _format_turns(turns),
+                "text": _format_turns(current),
                 "speaker": ", ".join(speakers),
-                "start": turns[0]["start"],
-                "end": turns[-1]["end"],
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
             }
         )
+
     return chunks

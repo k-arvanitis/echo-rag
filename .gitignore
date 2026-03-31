@@ -24,3 +24,5 @@ env/
 .nemo_cache/
 nemo_experiments/
 lightning_logs/
+
+/notebooks
