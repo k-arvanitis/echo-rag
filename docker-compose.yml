@@ -1,0 +1,16 @@
+services:
+  chroma:
+    image: chromadb/chroma:0.6.3
+    ports:
+      - "${CHROMA_PORT:-8009}:8009"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+      CHROMA_SERVER_HTTP_PORT: "8009"
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+    # Named volume — data survives container restarts and re-creates.
+    # To wipe all indexed audio: docker compose down -v

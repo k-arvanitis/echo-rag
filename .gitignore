@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# uv
+.python-version
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# ChromaDB data now lives in a Docker named volume — not a local folder
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.DS_Store
+*.wav
+*.mp3
+*.m4a
+*.flac
+.nemo_cache/
+nemo_experiments/
+lightning_logs/

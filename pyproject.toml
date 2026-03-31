@@ -1,0 +1,49 @@
+[project]
+name = "echo-rag"
+version = "0.1.0"
+description = "Speaker-aware RAG over audio: transcribe, diarize, embed, and query."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # STT + diarization (single-pass, no separate diarization model needed)
+    "transformers>=4.51.0",
+    "accelerate>=1.0.0",
+    "huggingface-hub>=0.34.0",   # transformers>=4.51 requires >=0.34
+    # Embeddings & Vector DB
+    "sentence-transformers>=3.2.0",
+    "chromadb==0.6.3",
+    # LLM client (vLLM OpenAI-compatible API)
+    "openai>=1.58.1",            # langchain-openai 0.2.14 requires >=1.58.1
+    # UI
+    "streamlit==1.41.0",
+    # Evaluation
+    "ragas==0.2.9",
+    "langchain-openai==0.2.14",
+    "langchain-huggingface==0.1.2",
+    # Audio I/O
+    "soundfile==0.12.1",
+    "librosa>=0.10.0",
+    # Utilities
+    "python-dotenv==1.0.1",
+    "numpy>=1.26.0",
+    "datasets>=3.1.0",
+    # PyTorch — installed via the pytorch index below (see [tool.uv.sources])
+    "torch==2.4.0",
+    "torchaudio==2.4.0",
+]
+
+[project.scripts]
+# After `uv sync`, run the CLI with: uv run audio-rag path/to/audio.wav
+echo-rag = "run_pipeline:main"
+
+# ---------------------------------------------------------------------------
+# uv: route torch/torchaudio to the PyTorch CUDA index.
+# Change cu121 → cu118 or cpu to match your hardware.
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
