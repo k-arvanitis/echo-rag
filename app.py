@@ -1,6 +1,7 @@
 """Streamlit UI: upload audio → transcribe → query with speaker-aware RAG."""
 import os
 import tempfile
+import uuid
 
 import streamlit as st
 
@@ -9,39 +10,68 @@ from pipeline.embed import (
     clear_collection,
     embed_chunks,
     get_chroma_collection,
+    get_show_notes,
     get_summary,
     load_embedding_model,
+    store_show_notes,
     store_summary,
 )
-from pipeline.rag import generate_answer_stream, generate_summary, retrieve
+from pipeline.rag import (
+    classify_intent,
+    compute_stats,
+    generate_answer_stream,
+    generate_show_notes,
+    generate_summary,
+    resolve_speaker_names,
+    retrieve,
+)
 from pipeline.transcribe import load_stt_model, transcribe
 
-st.set_page_config(page_title="Audio RAG", layout="wide")
+st.set_page_config(page_title="Echo", layout="wide", page_icon="🎙️")
+
+# Hide Streamlit chrome
+st.markdown("""
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+.block-container {padding-top: 2rem;}
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_resource
 def _stt_model():
-    """Cached VibeVoice-ASR processor + model (loaded once per session)."""
     return load_stt_model()
 
 
 @st.cache_resource
 def _embedding_model():
-    """Cached sentence-transformers embedding model (loaded once per session)."""
     return load_embedding_model()
 
 
-def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str]:
-    """Transcribe, chunk, summarize, and embed an audio file into ChromaDB.
+def _collection():
+    return get_chroma_collection(st.session_state["user_id"])
 
-    Returns (segments, summary).
-    """
-    collection = get_chroma_collection()
+
+def _fmt_ts(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict]:
+    collection = _collection()
 
     with st.status("Processing audio…", expanded=True) as status:
         st.write("Transcribing with VibeVoice-ASR…")
         segments = transcribe(audio_path, _stt_model())
         st.write(f"Transcription done — {len(segments)} segments.")
+
+        st.write("Identifying speakers…")
+        name_map = resolve_speaker_names(segments)
+        for s in segments:
+            s["speaker"] = name_map.get(s["speaker"], s["speaker"])
+        st.write(f"Speakers: {', '.join(name_map.values())}")
 
         st.write("Chunking transcript…")
         chunks = chunk_transcript(segments)
@@ -51,107 +81,191 @@ def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str]:
         summary = generate_summary(segments)
         st.write("Summary ready.")
 
+        st.write("Generating show notes…")
+        show_notes = generate_show_notes(chunks)
+        st.write(f"Show notes ready — {len(show_notes.get('chapters', []))} chapters.")
+
         st.write(f"Ingesting {len(chunks)} chunks into ChromaDB…")
         embed_chunks(chunks, collection, _embedding_model(), audio_filename=filename)
         store_summary(summary, collection, _embedding_model(), audio_filename=filename)
+        store_show_notes(show_notes, collection, audio_filename=filename)
         st.write("Ingestion complete.")
 
         status.update(label="Done!", state="complete", expanded=False)
 
-    return segments, summary
+    return segments, summary, show_notes
+
+
+def render_show_notes(show_notes: dict) -> None:
+    chapters = show_notes.get("chapters", [])
+    quotes = show_notes.get("quotes", [])
+    takeaways = show_notes.get("takeaways", [])
+
+    if chapters:
+        st.subheader("Chapters")
+        for ch in chapters:
+            with st.container(border=True):
+                st.markdown(f"**{_fmt_ts(ch.get('start', 0))}** — {ch.get('title', '')}")
+                if ch.get("summary"):
+                    st.caption(ch["summary"])
+
+    if takeaways:
+        st.subheader("Key Takeaways")
+        with st.container(border=True):
+            for t in takeaways:
+                st.markdown(f"- {t}")
+
+    if quotes:
+        st.subheader("Notable Quotes")
+        for q in quotes:
+            with st.container(border=True):
+                st.markdown(f"> {q.get('text', '')}")
+                st.caption(f"{q.get('speaker', '')} · {_fmt_ts(q.get('start', 0))}")
 
 
 def render_transcript(segments: list[dict]) -> None:
-    """Render transcript segments as a labeled table."""
-    st.subheader("Transcript")
+    def _speaker_label(s: dict) -> str:
+        text = s["text"].strip()
+        return "-" if text.startswith("[") and text.endswith("]") else s["speaker"]
+
     rows = [
-        {"Speaker": s["speaker"], "Start (s)": s["start"], "End (s)": s["end"], "Text": s["text"]}
+        {"Speaker": _speaker_label(s), "Start": _fmt_ts(s["start"]), "End": _fmt_ts(s["end"]), "Text": s["text"]}
         for s in segments
     ]
     st.dataframe(rows, use_container_width=True)
 
 
 def render_answer(answer: str, chunks: list[dict]) -> None:
-    """Render the RAG answer and expandable source chunks with speaker metadata."""
-    with st.expander("Source chunks", expanded=False):
+    audio_bytes = st.session_state.get("audio_bytes")
+    with st.expander("Sources", expanded=False):
         for i, c in enumerate(chunks, 1):
-            st.markdown(
-                f"**{i}. {c['speaker']}** &nbsp;|&nbsp; "
-                f"{c['start']:.1f}s – {c['end']:.1f}s\n\n{c['text']}"
-            )
-            st.caption(f"Distance: {c['distance']}  •  File: {c.get('audio_file', '')}")
-            st.divider()
+            with st.container(border=True):
+                st.markdown(
+                    f"**{i}. {c['speaker']}** &nbsp;|&nbsp; "
+                    f"{_fmt_ts(c['start'])} – {_fmt_ts(c['end'])}\n\n{c['text']}"
+                )
+                if audio_bytes:
+                    st.audio(audio_bytes, start_time=int(c["start"]))
+                st.caption(f"File: {c.get('audio_file', '')}  •  Distance: {c['distance']}")
 
 
 def render_sidebar() -> None:
-    """Render sidebar controls including the destructive clear button."""
     with st.sidebar:
-        st.header("Database")
-        st.caption("All uploaded files are indexed and queryable together.")
+        st.title("🎙️ Echo")
+        st.caption("Talk with your podcasts.")
         st.divider()
-        if st.button("Clear all indexed audio", type="secondary"):
+
+        uploaded = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "flac"])
+
+        st.divider()
+        if st.button("Clear my indexed audio", type="secondary", use_container_width=True):
             st.session_state["confirm_clear"] = True
 
         if st.session_state.get("confirm_clear"):
-            st.warning("This will delete all indexed audio from ChromaDB.")
+            st.warning("This will delete all your indexed audio.")
             col1, col2 = st.columns(2)
             if col1.button("Yes, clear", type="primary"):
-                clear_collection(get_chroma_collection())
-                st.session_state.clear()
-                st.success("Database cleared.")
+                clear_collection(_collection())
+                for key in ["segments", "summary", "show_notes", "last_filename", "audio_bytes", "confirm_clear"]:
+                    st.session_state.pop(key, None)
+                st.success("Cleared.")
                 st.rerun()
             if col2.button("Cancel"):
                 st.session_state["confirm_clear"] = False
                 st.rerun()
 
+    return uploaded
+
 
 def main() -> None:
-    """Main Streamlit entry point."""
-    render_sidebar()
+    # Assign a unique ID per browser session for collection isolation
+    if "user_id" not in st.session_state:
+        st.session_state["user_id"] = str(uuid.uuid4())
 
-    st.title("Audio RAG")
-    st.caption(
-        "Upload audio files — each one is indexed and queryable together. "
-        "Previous uploads are preserved across sessions."
-    )
-
-    uploaded = st.file_uploader("Upload audio file", type=["wav", "mp3", "m4a", "flac"])
+    uploaded = render_sidebar()
 
     if uploaded is not None:
         if st.session_state.get("last_filename") != uploaded.name:
             suffix = os.path.splitext(uploaded.name)[1]
+            audio_bytes = uploaded.read()
+            st.session_state["audio_bytes"] = audio_bytes
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(uploaded.read())
+                tmp.write(audio_bytes)
                 tmp_path = tmp.name
 
-            segments, summary = process_audio(tmp_path, uploaded.name)
+            segments, summary, show_notes = process_audio(tmp_path, uploaded.name)
             os.unlink(tmp_path)
 
             st.session_state["segments"] = segments
             st.session_state["summary"] = summary
+            st.session_state["show_notes"] = show_notes
             st.session_state["last_filename"] = uploaded.name
 
-        # If already indexed in a previous session, fetch the stored summary
         elif "summary" not in st.session_state:
-            stored = get_summary(get_chroma_collection(), uploaded.name)
-            if stored:
-                st.session_state["summary"] = stored
+            collection = _collection()
+            st.session_state["summary"] = get_summary(collection, uploaded.name)
+            st.session_state["show_notes"] = get_show_notes(collection, uploaded.name)
 
-    if st.session_state.get("summary"):
-        st.subheader("What this podcast is about")
-        st.write(st.session_state["summary"])
+    if not st.session_state.get("summary"):
+        st.markdown("## Upload a podcast to get started")
+        st.caption("Supports MP3, WAV, M4A, FLAC · Transcription + speaker diarization runs locally")
+        return
 
-    if st.session_state.get("segments"):
-        render_transcript(st.session_state["segments"])
+    tab_overview, tab_show_notes, tab_transcript, tab_ask = st.tabs(
+        ["Overview", "Show Notes", "Transcript", "Ask"]
+    )
 
-        st.subheader("Ask a Question")
-        query = st.text_input("Enter your question about the audio content")
+    with tab_overview:
+        st.subheader(st.session_state.get("last_filename", "Episode"))
+        with st.container(border=True):
+            st.write(st.session_state["summary"])
 
-        if query and st.button("Ask"):
-            chunks = retrieve(query, get_chroma_collection(), _embedding_model())
-            st.subheader("Answer")
-            answer = st.write_stream(generate_answer_stream(query, chunks))
-            render_answer(answer, chunks)
+    with tab_show_notes:
+        show_notes = st.session_state.get("show_notes") or {}
+        if show_notes:
+            render_show_notes(show_notes)
+        else:
+            st.info("Show notes not available for this episode.")
+
+    with tab_transcript:
+        if st.session_state.get("segments"):
+            render_transcript(st.session_state["segments"])
+        else:
+            st.info("Transcript not available — re-upload the file to generate it.")
+
+    with tab_ask:
+        query = st.text_input("Ask anything about this podcast", placeholder="Who spoke more? What was the main argument?")
+        if query and st.button("Ask", type="primary"):
+            intent = classify_intent(query)
+
+            if intent == "summary":
+                with st.container(border=True):
+                    st.write(st.session_state.get("summary", "No summary available."))
+
+            elif intent == "stats":
+                segments = st.session_state.get("segments", [])
+                if segments:
+                    stats = compute_stats(segments)
+                    cols = st.columns(3)
+                    cols[0].metric("Duration", _fmt_ts(stats["duration"]))
+                    cols[1].metric("Total words", f"{stats['total_words']:,}")
+                    cols[2].metric("Avg pace", f"{stats['avg_pace_wpm']} wpm")
+                    st.divider()
+                    for spk in stats["speakers"]:
+                        with st.container(border=True):
+                            st.markdown(f"**{spk['speaker']}**")
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Talk time", _fmt_ts(spk["talk_time"]))
+                            c2.metric("Share", f"{spk['talk_pct']}%")
+                            c3.metric("Words", f"{spk['words']:,}")
+                else:
+                    st.info("Re-upload the file to compute speaker stats.")
+
+            else:
+                chunks = retrieve(query, _collection(), _embedding_model())
+                with st.container(border=True):
+                    answer = st.write_stream(generate_answer_stream(query, chunks))
+                render_answer(answer, chunks)
 
 
 if __name__ == "__main__":

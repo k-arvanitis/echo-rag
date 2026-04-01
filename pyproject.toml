@@ -16,9 +16,7 @@ dependencies = [
     # UI
     "streamlit==1.41.0",
     # Evaluation
-    "ragas==0.2.9",
-    "langchain-openai==0.2.14",
-    "langchain-huggingface==0.1.2",
+    "deepeval>=2.0.0",
     # Audio I/O
     "soundfile==0.12.1",
     "librosa>=0.10.0",
