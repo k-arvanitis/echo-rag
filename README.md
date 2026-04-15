@@ -18,11 +18,23 @@ Query who said what across your recorded meetings, sales calls, and interviews. 
 
 ## What it does
 
-1. **Transcribe** — [VibeVoice-ASR-7B](https://huggingface.co/microsoft/VibeVoice-ASR) served via vLLM. Single-pass STT + speaker diarization + timestamps, no resampling needed. Handles up to 45 min per chunk; longer recordings are split automatically.
-2. **Chunk** — Speaker turns are grouped by character budget (≤1500 chars). Boundaries always fall at speaker-change points so each chunk is a coherent exchange. Fixed-size chunking was rejected because speaker turns are the natural semantic unit in a conversation — cutting across them loses the question that prompted an answer.
-3. **Embed** — Each chunk is embedded with `BAAI/bge-m3` and upserted into ChromaDB (Docker), with speaker, timestamps, and source file stored as metadata.
-4. **Query** — User questions optionally go through HyDE (Hypothetical Document Embeddings) before retrieval. Top candidates are fetched from ChromaDB, reranked with a cross-encoder, and a speaker-labeled context prompt is sent to Llama 3.3 70B via Groq.
-5. **UI** — Streamlit shows an overview summary, auto-generated show notes (chapters + quotes + takeaways), full transcript table, and a free-form Ask tab. Source chunks link back to the exact audio timestamp.
+1. **Transcribe** — [VibeVoice-ASR-7B](https://huggingface.co/microsoft/VibeVoice-ASR) served via vLLM performs single-pass speech-to-text + speaker diarization + timestamps with no resampling needed. Recordings longer than 45 minutes are split automatically and reassembled with correct offsets.
+
+2. **Name speakers** — After transcription, the LLM scans the opening of the conversation to suggest real names for each speaker ID. A naming form lets you confirm, correct, or fill in names that weren't mentioned — useful for internal meetings where nobody introduces themselves. Names are applied to all chunks before indexing, so every answer and source cite the person by name.
+
+3. **Chunk** — Speaker turns are grouped by character budget (≤1500 chars). Boundaries always fall at speaker-change points so each chunk is a coherent exchange. Fixed-size chunking was rejected because speaker turns are the natural semantic unit in a conversation — cutting across them loses the question that prompted an answer.
+
+4. **Embed** — Each chunk is embedded with `BAAI/bge-m3` and upserted into ChromaDB (Docker), with speaker name, timestamps, and source filename stored as metadata. A summary and show notes are also stored for instant retrieval.
+
+5. **Query** — User questions optionally go through HyDE (Hypothetical Document Embeddings): the LLM first writes a short hypothetical transcript excerpt that would answer the question, and that excerpt is embedded instead of the raw query — improving recall for vague questions. Top candidates are fetched from ChromaDB, reranked with a cross-encoder, and a speaker-labeled context prompt is sent to Llama 3.3 70B via Groq.
+
+6. **UI** — Four tabs, all generated automatically on upload:
+   - **Overview** — a concise 2-3 paragraph summary of the full recording covering main topics, key points, and who said what.
+   - **Show Notes** — timestamped chapters (e.g. "14:22 — Pricing objections"), notable quotes attributed to each speaker, and synthesised key takeaways.
+   - **Transcript** — full speaker-labelled transcript table with start/end timestamps, filterable and scrollable.
+   - **Ask** — free-form question answering. Answers stream in real time. Expanding "Sources" shows each retrieved chunk with speaker label, timestamp range, and an inline audio player seeked to that exact moment.
+
+   The sidebar lets you upload a new recording or clear your indexed audio entirely. Each browser session gets its own isolated ChromaDB collection, so multiple users can index different recordings simultaneously without interference.
 
 ## Use cases
 
