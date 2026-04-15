@@ -21,7 +21,7 @@ Query who said what across your recorded meetings, sales calls, and interviews. 
 1. **Transcribe** — [VibeVoice-ASR-7B](https://huggingface.co/microsoft/VibeVoice-ASR) served via vLLM. Single-pass STT + speaker diarization + timestamps, no resampling needed. Handles up to 45 min per chunk; longer recordings are split automatically.
 2. **Chunk** — Speaker turns are grouped by character budget (≤1500 chars). Boundaries always fall at speaker-change points so each chunk is a coherent exchange. Fixed-size chunking was rejected because speaker turns are the natural semantic unit in a conversation — cutting across them loses the question that prompted an answer.
 3. **Embed** — Each chunk is embedded with `BAAI/bge-m3` and upserted into ChromaDB (Docker), with speaker, timestamps, and source file stored as metadata.
-4. **Query** — User questions optionally go through HyDE (Hypothetical Document Embeddings) before retrieval. Top candidates are fetched from ChromaDB, reranked with a cross-encoder, and a speaker-labeled context prompt is sent to GPT-4o-mini.
+4. **Query** — User questions optionally go through HyDE (Hypothetical Document Embeddings) before retrieval. Top candidates are fetched from ChromaDB, reranked with a cross-encoder, and a speaker-labeled context prompt is sent to Llama 3.3 70B via Groq.
 5. **UI** — Streamlit shows an overview summary, auto-generated show notes (chapters + quotes + takeaways), full transcript table, and a free-form Ask tab. Source chunks link back to the exact audio timestamp.
 
 ## Use cases
@@ -65,7 +65,7 @@ Audio file
 │  pipeline/rag.py                                │
 │  HyDE: hypothetical excerpt embedding           │
 │  ChromaDB top-k  ──▶  cross-encoder rerank      │
-│  speaker-labeled context  ──▶  GPT-4o-mini      │
+│  speaker-labeled context  ──▶  Llama 3.3 70B    │
 └──────────────────────────┬──────────────────────┘
                            │
                            ▼
@@ -168,7 +168,7 @@ echo-rag/
 │   ├── transcribe_vibevoice_vllm.py  # VibeVoice-ASR via vLLM (default STT)
 │   ├── chunk.py                      # Character-budget chunking over speaker turns
 │   ├── embed.py                      # bge-m3 embeddings → ChromaDB
-│   └── rag.py                        # HyDE, retrieval, reranking, GPT-4o-mini
+│   └── rag.py                        # HyDE, retrieval, reranking, Groq LLM
 ├── tests/
 │   ├── test_chunk.py              # Chunking unit tests
 │   ├── test_rag.py                # RAG pipeline unit tests
