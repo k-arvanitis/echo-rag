@@ -1,8 +1,9 @@
-"""Retrieve relevant chunks and generate answers via vLLM."""
+"""Retrieve relevant chunks and generate answers via OpenAI API."""
 import json
 import logging
 import re
 from collections.abc import Iterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +11,22 @@ import chromadb
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
-from config import MAX_TOKENS, TOP_K_RESULTS, VLLM_BASE_URL, VLLM_MODEL
+from config import (
+    HYDE_ENABLED,
+    LLM_MODEL,
+    MAX_TOKENS,
+    OPENAI_API_KEY,
+    RERANKER_ENABLED,
+    RERANKER_MODEL,
+    TOP_K_RESULTS,
+)
+
+# Candidates fetched from ChromaDB before reranking.
+# Needs to be larger than TOP_K_RESULTS so the reranker has room to reorder.
+_RERANKER_FETCH_K = 10
+
+# Module-level reranker instance — loaded once on first retrieval call.
+_reranker: Any = None
 
 _SYSTEM_PROMPT = (
     "You are an assistant that answers questions about audio transcripts. "
@@ -41,16 +57,91 @@ Rules:
 
 
 def _build_openai_client() -> OpenAI:
-    """Create an OpenAI client pointed at the local vLLM server."""
-    return OpenAI(base_url=VLLM_BASE_URL, api_key="dummy")
-
-
-# Qwen3 defaults to "thinking" mode which emits <think>…</think> before every response.
-# Disable it so RAG answers and JSON outputs are clean.
-_NO_THINK: dict = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    """Create an OpenAI client using the configured API key."""
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 # ~4500 tokens; leaves room for system prompt + response within 8k context
 _SHOW_NOTES_CHAR_BUDGET = 18_000
+
+
+def _get_reranker() -> Any:
+    """Lazily load and cache the cross-encoder reranker.
+
+    Returns the CrossEncoder instance, or None if reranking is disabled or
+    the model fails to load (in which case a warning is logged).
+    """
+    global _reranker
+    if not RERANKER_ENABLED:
+        return None
+    if _reranker is not None:
+        return _reranker
+    try:
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder(RERANKER_MODEL)
+        logger.info("reranker loaded: %s", RERANKER_MODEL)
+    except Exception as e:
+        logger.warning("reranker failed to load (%s) — falling back to embedding-distance order", e)
+        _reranker = None
+    return _reranker
+
+
+def _generate_hyde_query(query: str) -> str:
+    """Generate a hypothetical transcript excerpt for HyDE retrieval.
+
+    Sends the query to the vLLM server asking for a 1-2 sentence hypothetical
+    answer as if it were spoken in a meeting transcript. Returns the hypothetical
+    text to embed in place of the raw query.
+
+    Falls back to the original query string if the vLLM call fails.
+    """
+    from openai import APIConnectionError, APIStatusError
+    client = _build_openai_client()
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are helping retrieve relevant meeting transcript segments. "
+                        "Write a 1-2 sentence hypothetical transcript excerpt that would answer this question:"
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            max_tokens=100,
+            temperature=0.5,
+
+        )
+        hypothetical = response.choices[0].message.content.strip()
+        logger.debug("HyDE hypothetical: %r", hypothetical)
+        return hypothetical
+    except (APIConnectionError, APIStatusError) as e:
+        logger.warning("HyDE generation failed (%s) — falling back to direct query embedding", e)
+        return query
+
+
+def get_speakers(collection: chromadb.Collection) -> list[str]:
+    """Return a sorted list of unique speaker names present in the collection.
+
+    Skips meta documents (summary, show_notes). Speaker values that contain
+    multiple names joined by ', ' (multi-speaker chunks) are split so each
+    individual name appears in the result.
+    """
+    try:
+        result = collection.get(include=["metadatas"])
+    except Exception as e:
+        logger.warning("could not fetch speakers from ChromaDB: %s", e)
+        return []
+    speakers: set[str] = set()
+    for meta in result.get("metadatas") or []:
+        if meta.get("type") in ("summary", "show_notes"):
+            continue
+        for spk in meta.get("speaker", "").split(", "):
+            spk = spk.strip()
+            if spk:
+                speakers.add(spk)
+    return sorted(speakers)
 
 
 def retrieve(
@@ -58,14 +149,36 @@ def retrieve(
     collection: chromadb.Collection,
     embedding_model: SentenceTransformer,
     top_k: int = TOP_K_RESULTS,
+    speaker_filter: list[str] | None = None,
 ) -> list[dict]:
-    """Embed query and return top-k chunks with their speaker metadata."""
-    query_embedding = embedding_model.encode(query).tolist()
+    """Embed query and return top-k chunks, with optional reranking and speaker filter.
+
+    Pipeline:
+      1. HyDE (if enabled): generate a hypothetical transcript excerpt and embed
+         that instead of the raw query to improve recall on vague questions.
+      2. ChromaDB ANN search: fetch `_RERANKER_FETCH_K` candidates (more than
+         top_k so the reranker has candidates to reorder).
+      3. Cross-encoder reranking (if enabled): re-score every (query, chunk) pair
+         and sort by reranker score.  Falls back to embedding-distance order if the
+         model failed to load.
+      4. Speaker filter: if `speaker_filter` is provided, only chunks whose
+         `speaker` metadata value is in the list are returned.  Applied at the
+         ChromaDB query level via a `where` clause.
+    """
+    # Step 1: optionally replace query with a hypothetical document for HyDE
+    embed_text = _generate_hyde_query(query) if HYDE_ENABLED else query
+    query_embedding = embedding_model.encode(embed_text).tolist()
+
+    # Step 2: fetch candidates — more than top_k when reranking is on
+    fetch_k = max(_RERANKER_FETCH_K, top_k * 2) if RERANKER_ENABLED else top_k + 2
+    where = {"speaker": {"$in": speaker_filter}} if speaker_filter else None
+
     try:
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=top_k + 2,  # fetch extra to account for filtered-out meta docs
+            n_results=fetch_k,
             include=["documents", "metadatas", "distances"],
+            where=where,
         )
     except Exception as e:
         raise RuntimeError(f"ChromaDB query failed: {e}") from e
@@ -79,6 +192,18 @@ def retrieve(
         if meta.get("type") in ("summary", "show_notes"):
             continue
         chunks.append({**meta, "text": doc, "distance": round(dist, 4)})
+
+    # Step 3: rerank if a cross-encoder is available
+    reranker = _get_reranker()
+    if reranker is not None and len(chunks) > top_k:
+        try:
+            pairs = [(query, c["text"]) for c in chunks]
+            scores = reranker.predict(pairs)
+            chunks = [c for _, c in sorted(zip(scores, chunks), key=lambda x: -x[0])]
+            logger.debug("reranked %d candidates → top %d", len(chunks), top_k)
+        except Exception as e:
+            logger.warning("reranking failed (%s) — using embedding-distance order", e)
+
     return chunks[:top_k]
 
 
@@ -97,7 +222,7 @@ def generate_answer(query: str, chunks: list[dict]) -> str:
     client = _build_openai_client()
     try:
         response = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {
@@ -107,12 +232,12 @@ def generate_answer(query: str, chunks: list[dict]) -> str:
             ],
             max_tokens=MAX_TOKENS,
             temperature=0.1,
-            **_NO_THINK,
+
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach vLLM at {VLLM_BASE_URL}. Is the server running?") from e
+        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"vLLM returned an error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
     return response.choices[0].message.content.strip()
 
 
@@ -122,7 +247,7 @@ def generate_answer_stream(query: str, chunks: list[dict]) -> Iterator[str]:
     client = _build_openai_client()
     try:
         stream = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {
@@ -133,12 +258,12 @@ def generate_answer_stream(query: str, chunks: list[dict]) -> Iterator[str]:
             max_tokens=MAX_TOKENS,
             temperature=0.1,
             stream=True,
-            **_NO_THINK,
+
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach vLLM at {VLLM_BASE_URL}. Is the server running?") from e
+        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"vLLM returned an error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
     for chunk in stream:
         delta = chunk.choices[0].delta.content
         if delta:
@@ -153,19 +278,19 @@ def generate_summary(segments: list[dict]) -> str:
     client = _build_openai_client()
     try:
         response = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
             max_tokens=512,
             temperature=0.3,
-            **_NO_THINK,
+
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach vLLM at {VLLM_BASE_URL}. Is the server running?") from e
+        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"vLLM returned an error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
     return response.choices[0].message.content.strip()
 
 
@@ -210,7 +335,7 @@ def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
     client = _build_openai_client()
     try:
         response = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -228,7 +353,7 @@ def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
             ],
             max_tokens=128,
             temperature=0.0,
-            **_NO_THINK,
+
         )
     except (APIConnectionError, APIStatusError) as e:
         logger.warning("speaker name resolution failed (%s) — using fallback labels", e)
@@ -322,19 +447,19 @@ def generate_show_notes(chunks: list[dict]) -> dict:
     client = _build_openai_client()
     try:
         response = client.chat.completions.create(
-            model=VLLM_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": _SHOW_NOTES_PROMPT},
                 {"role": "user", "content": transcript},
             ],
             max_tokens=1024,
             temperature=0.2,
-            **_NO_THINK,
+
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach vLLM at {VLLM_BASE_URL}. Is the server running?") from e
+        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"vLLM returned an error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
     raw = response.choices[0].message.content.strip()
     try:
         return json.loads(raw)

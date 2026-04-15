@@ -3,6 +3,8 @@ import os
 import tempfile
 import uuid
 
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 import streamlit as st
 
 from pipeline.chunk import chunk_transcript
@@ -17,8 +19,6 @@ from pipeline.embed import (
     store_summary,
 )
 from pipeline.rag import (
-    classify_intent,
-    compute_stats,
     generate_answer_stream,
     generate_show_notes,
     generate_summary,
@@ -190,9 +190,10 @@ def render_answer(answer: str, chunks: list[dict]) -> None:
 
 
 def render_sidebar() -> None:
+    """Render sidebar widgets. Returns uploaded file."""
     with st.sidebar:
         st.title("🎙️ Echo")
-        st.caption("Talk with your podcasts.")
+        st.caption("Query your meetings, calls, and interviews.")
         st.divider()
 
         uploaded = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a", "flac"])
@@ -251,7 +252,7 @@ def main() -> None:
             st.session_state["show_notes"] = get_show_notes(collection, uploaded.name)
 
     if not st.session_state.get("summary"):
-        st.markdown("## Upload a podcast to get started")
+        st.markdown("## Upload a meeting recording to get started")
         st.caption("Supports MP3, WAV, M4A, FLAC · Transcription + speaker diarization runs locally")
         return
 
@@ -279,43 +280,17 @@ def main() -> None:
 
     with tab_ask:
         with st.form("ask_form", border=False):
-            query = st.text_input("Ask anything about this podcast", placeholder="Who spoke more? What was the main argument?")
+            query = st.text_input("Ask anything about this recording", placeholder="What did we commit to? What objections came up?")
             submitted = st.form_submit_button("Ask", type="primary")
 
         if submitted and query:
-            intent = classify_intent(query)
-
-            if intent == "summary":
+            try:
+                chunks = retrieve(query, _collection(), _embedding_model())
                 with st.container(border=True):
-                    st.write(st.session_state.get("summary", "No summary available."))
-
-            elif intent == "stats":
-                segments = st.session_state.get("segments", [])
-                if segments:
-                    stats = compute_stats(segments)
-                    cols = st.columns(3)
-                    cols[0].metric("Duration", _fmt_ts(stats["duration"]))
-                    cols[1].metric("Total words", f"{stats['total_words']:,}")
-                    cols[2].metric("Avg pace", f"{stats['avg_pace_wpm']} wpm")
-                    st.divider()
-                    for spk in stats["speakers"]:
-                        with st.container(border=True):
-                            st.markdown(f"**{spk['speaker']}**")
-                            c1, c2, c3 = st.columns(3)
-                            c1.metric("Talk time", _fmt_ts(spk["talk_time"]))
-                            c2.metric("Share", f"{spk['talk_pct']}%")
-                            c3.metric("Words", f"{spk['words']:,}")
-                else:
-                    st.info("Re-upload the file to compute speaker stats.")
-
-            else:
-                try:
-                    chunks = retrieve(query, _collection(), _embedding_model())
-                    with st.container(border=True):
-                        answer = st.write_stream(generate_answer_stream(query, chunks))
-                    render_answer(answer, chunks)
-                except RuntimeError as e:
-                    st.error(str(e))
+                    answer = st.write_stream(generate_answer_stream(query, chunks))
+                render_answer(answer, chunks)
+            except RuntimeError as e:
+                st.error(str(e))
 
 
 if __name__ == "__main__":

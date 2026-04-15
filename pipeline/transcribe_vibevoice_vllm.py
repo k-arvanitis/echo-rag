@@ -97,7 +97,7 @@ def _call_api(audio_path: str, duration: float) -> list[dict]:
                 ],
             },
         ],
-        max_tokens=32768,
+        max_tokens=None,
         temperature=0.0,
         top_p=1.0,
         stream=True,

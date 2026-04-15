@@ -12,8 +12,8 @@ load_dotenv()
 # --- HuggingFace (optional — used if the model repo is private or rate-limited) ---
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")
 
-# --- STT backend: "parakeet" (default), "vibevoice_vllm", or "vibevoice" ---
-STT_BACKEND: str = os.getenv("STT_BACKEND", "parakeet")
+# --- STT backend: "vibevoice_vllm" (default), "parakeet", or "vibevoice" ---
+STT_BACKEND: str = os.getenv("STT_BACKEND", "vibevoice_vllm")
 
 # --- STT (VibeVoice-ASR: single-pass transcription + diarization + timestamps) ---
 STT_MODEL: str = os.getenv("STT_MODEL", "microsoft/VibeVoice-ASR")
@@ -30,9 +30,9 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 CHROMA_HOST: str = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8010"))
 
-# --- vLLM ---
-VLLM_BASE_URL: str = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
-VLLM_MODEL: str = os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B")
+# --- LLM (OpenAI API) ---
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
 MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "512"))
 
 # --- RAG ---
@@ -57,3 +57,14 @@ DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "0"))
 # Max characters per chunk. Turns are never split; a single oversized turn becomes its own chunk.
 # ~1500 chars ≈ 2-3 minutes of typical conversational speech.
 CHUNK_MAX_CHARS: int = int(os.getenv("CHUNK_MAX_CHARS", "1500"))
+
+# --- Retrieval enhancements ---
+# Cross-encoder reranker: after fetching candidates from ChromaDB, score each
+# (query, chunk) pair and return only the top-k by reranker score.
+RERANKER_MODEL: str = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANKER_ENABLED: bool = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
+
+# HyDE (Hypothetical Document Embeddings): ask the LLM to write a short
+# hypothetical transcript excerpt that would answer the query, then embed
+# that excerpt instead of the raw query. Improves recall for vague questions.
+HYDE_ENABLED: bool = os.getenv("HYDE_ENABLED", "true").lower() == "true"
