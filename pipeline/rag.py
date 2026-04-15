@@ -12,10 +12,11 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 from config import (
+    GROQ_API_KEY,
+    GROQ_BASE_URL,
     HYDE_ENABLED,
     LLM_MODEL,
     MAX_TOKENS,
-    OPENAI_API_KEY,
     RERANKER_ENABLED,
     RERANKER_MODEL,
     TOP_K_RESULTS,
@@ -57,8 +58,8 @@ Rules:
 
 
 def _build_openai_client() -> OpenAI:
-    """Create an OpenAI client using the configured API key."""
-    return OpenAI(api_key=OPENAI_API_KEY)
+    """Create an OpenAI-compatible client pointed at the Groq API."""
+    return OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
 
 # ~4500 tokens; leaves room for system prompt + response within 8k context
 _SHOW_NOTES_CHAR_BUDGET = 18_000
@@ -206,9 +207,9 @@ def generate_answer(query: str, chunks: list[dict]) -> str:
 
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
+        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
     return response.choices[0].message.content.strip()
 
 
@@ -232,9 +233,9 @@ def generate_answer_stream(query: str, chunks: list[dict]) -> Iterator[str]:
 
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
+        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
     for chunk in stream:
         delta = chunk.choices[0].delta.content
         if delta:
@@ -259,9 +260,9 @@ def generate_summary(segments: list[dict]) -> str:
 
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
+        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
     return response.choices[0].message.content.strip()
 
 
@@ -380,9 +381,9 @@ def generate_show_notes(chunks: list[dict]) -> dict:
 
         )
     except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach OpenAI API. Check your OPENAI_API_KEY and network connection.") from e
+        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(f"OpenAI API error: {e.status_code} — {e.message}") from e
+        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
     raw = response.choices[0].message.content.strip()
     try:
         return json.loads(raw)
@@ -402,7 +403,23 @@ def query_rag(
     collection: chromadb.Collection,
     embedding_model: SentenceTransformer,
 ) -> tuple[str, list[dict]]:
-    """Retrieve relevant chunks then generate an answer. Returns (answer, chunks)."""
-    chunks = retrieve(question, collection, embedding_model)
-    answer = generate_answer(question, chunks)
+    """Retrieve relevant chunks then generate an answer. Returns (answer, chunks).
+
+    Always returns a (str, list) tuple — never raises. Handles retrieval
+    failures and empty results gracefully so callers get a readable message
+    instead of an exception.
+    """
+    try:
+        chunks = retrieve(question, collection, embedding_model)
+    except RuntimeError as e:
+        return str(e), []
+
+    if not chunks:
+        return "No relevant content found in the indexed audio.", []
+
+    try:
+        answer = generate_answer(question, chunks)
+    except RuntimeError as e:
+        return str(e), chunks
+
     return answer, chunks

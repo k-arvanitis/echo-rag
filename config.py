@@ -19,9 +19,10 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 CHROMA_HOST: str = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8010"))
 
-# --- LLM (OpenAI API) ---
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# --- LLM (Groq API — OpenAI-compatible) ---
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
+LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "512"))
 
 # --- RAG ---

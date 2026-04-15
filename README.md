@@ -1,3 +1,11 @@
+[![CI](https://github.com/k-arvanitis/echo-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/k-arvanitis/echo-rag/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![ChromaDB](https://img.shields.io/badge/ChromaDB-FF6B35?style=for-the-badge&logoColor=white)
+
+<!-- demo: replace with a screen recording or YouTube link -->
+
 # Echo — Meeting Intelligence
 
 Query who said what across your recorded meetings, sales calls, and interviews. Speaker-aware retrieval with timestamps.
@@ -9,7 +17,7 @@ Query who said what across your recorded meetings, sales calls, and interviews. 
 ## What it does
 
 1. **Transcribe** — [VibeVoice-ASR-7B](https://huggingface.co/microsoft/VibeVoice-ASR) served via vLLM. Single-pass STT + speaker diarization + timestamps, no resampling needed. Handles up to 45 min per chunk; longer recordings are split automatically.
-2. **Chunk** — Speaker turns are grouped by character budget (≤1500 chars). Boundaries always fall at speaker-change points so each chunk is a coherent exchange.
+2. **Chunk** — Speaker turns are grouped by character budget (≤1500 chars). Boundaries always fall at speaker-change points so each chunk is a coherent exchange. Fixed-size chunking was rejected because speaker turns are the natural semantic unit in a conversation — cutting across them loses the question that prompted an answer.
 3. **Embed** — Each chunk is embedded with `BAAI/bge-m3` and upserted into ChromaDB (Docker), with speaker, timestamps, and source file stored as metadata.
 4. **Query** — User questions optionally go through HyDE (Hypothetical Document Embeddings) before retrieval. Top candidates are fetched from ChromaDB, reranked with a cross-encoder, and a speaker-labeled context prompt is sent to GPT-4o-mini.
 5. **UI** — Streamlit shows an overview summary, auto-generated show notes (chapters + quotes + takeaways), full transcript table, and a free-form Ask tab. Source chunks link back to the exact audio timestamp.
@@ -67,6 +75,23 @@ Audio file
 
 VibeVoice-ASR handles transcription and speaker diarization in a single model pass — no separate diarization pipeline, no timestamp alignment step, no pyannote dependency. Audio never leaves your machine.
 
+## Tech stack
+
+| Component | Role | Why |
+|---|---|---|
+| [VibeVoice-ASR-7B](https://huggingface.co/microsoft/VibeVoice-ASR) (vLLM) | Transcription + speaker diarization | Single-pass ASR + diarization — no separate alignment step, no pyannote dependency, speaker labels native to the model |
+| [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) | Chunk embeddings | Strong multilingual dense embeddings, runs locally, no API cost at query time — suitable for confidential meeting content |
+| [ChromaDB](https://www.trychroma.com/) | Vector store | Lightweight, Docker-native, no cloud dependency — keeps all transcript data on-premise; sufficient for single-tenant meeting use cases |
+| Speaker-turn chunking | Segmentation | Fixed-size chunking splits mid-sentence and mid-exchange — speaker-turn boundaries preserve Q+A context naturally |
+| [llama-3.3-70b](https://console.groq.com/docs/models) (Groq) | RAG answers, summaries, show notes | Fast inference via Groq's OpenAI-compatible API; swap `LLM_MODEL` in `.env` to use any Groq model without code changes |
+| [Streamlit](https://streamlit.io/) | UI | Fastest path to a working UI for a pipeline demo; no frontend build step |
+
+## Privacy & data
+
+Audio processing and speaker diarization run locally via VibeVoice-ASR — raw audio never leaves your machine. Transcript chunks and embeddings are stored in ChromaDB running in a local Docker container.
+
+LLM inference (RAG answers, summaries, show notes) uses Groq's API; transcript text is transmitted to Groq for these steps. To keep all data fully on-premise, point `VIBEVOICE_VLLM_URL` and `LLM_MODEL` at a local vLLM server and remove the `GROQ_API_KEY` dependency.
+
 ## Setup
 
 ### 1. Prerequisites
@@ -76,7 +101,7 @@ VibeVoice-ASR handles transcription and speaker diarization in a single model pa
 | [uv](https://astral.sh/uv) | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | [Docker](https://docs.docker.com/get-docker/) | Runs ChromaDB + VibeVoice | See docker.com |
 | NVIDIA GPU (≥24 GB VRAM) | VibeVoice-ASR-7B inference | — |
-| OpenAI API key | GPT-4o-mini for RAG answers | [platform.openai.com](https://platform.openai.com/api-keys) |
+| Groq API key | LLM for RAG answers | [console.groq.com](https://console.groq.com/keys) |
 
 ### 2. Clone and install
 
@@ -90,7 +115,7 @@ uv sync
 
 ```bash
 cp .env.example .env
-# Set OPENAI_API_KEY — all other values are pre-filled with correct defaults
+# Set GROQ_API_KEY — all other values are pre-filled with correct defaults
 ```
 
 ### 4. Start services
@@ -113,34 +138,12 @@ uv run streamlit run app.py
 
 Open [http://localhost:8501](http://localhost:8501). Upload an audio file — transcription + indexing runs automatically.
 
-## Evaluation
-
-QA pairs are synthesized from indexed chunks using GPT-4o-mini, then judged on four [DeepEval](https://docs.confident-ai.com/) metrics:
-
-```bash
-uv run python eval/evaluate.py --user-id <session-uuid>
-
-# Save QA pairs for re-use
-uv run python eval/evaluate.py --user-id <uuid> --save eval/qa_pairs.json
-
-# Re-use saved pairs (skip synthesis)
-uv run python eval/evaluate.py --user-id <uuid> --dataset eval/qa_pairs.json
-```
-
-| Metric | What it measures |
-|---|---|
-| Faithfulness | Answer grounded in retrieved context? |
-| Answer Relevancy | Answer addresses the question? |
-| Contextual Precision | Top chunks are the most relevant? |
-| Contextual Recall | Chunks contain what's needed to answer? |
-
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | OpenAI API key |
-| `LLM_MODEL` | `gpt-4o-mini` | Chat model for RAG answers and show notes |
-| `STT_BACKEND` | `vibevoice_vllm` | `vibevoice_vllm` (default), `parakeet` (Whisper+pyannote), or `vibevoice` (in-process) |
+| `GROQ_API_KEY` | *(required)* | Groq API key |
+| `LLM_MODEL` | `llama-3.3-70b-versatile` | Any model available on Groq |
 | `VIBEVOICE_VLLM_URL` | `http://localhost:8001/v1` | VibeVoice vLLM endpoint |
 | `VIBEVOICE_GPU_UTIL` | `0.60` | GPU memory fraction for VibeVoice container |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
@@ -161,15 +164,13 @@ echo-rag/
 ├── config.py                      # All env var reads — single source of truth
 ├── pipeline/
 │   ├── transcribe_vibevoice_vllm.py  # VibeVoice-ASR via vLLM (default STT)
-│   ├── transcribe_parakeet.py        # Whisper Large V3 Turbo + pyannote
-│   ├── transcribe.py                 # VibeVoice-ASR in-process
 │   ├── chunk.py                      # Character-budget chunking over speaker turns
 │   ├── embed.py                      # bge-m3 embeddings → ChromaDB
 │   └── rag.py                        # HyDE, retrieval, reranking, GPT-4o-mini
-├── eval/
-│   └── evaluate.py                # DeepEval: 4-metric RAG evaluation
 ├── tests/
-│   └── test_rag.py                # Unit tests for RAG pipeline
+│   ├── test_chunk.py              # Chunking unit tests
+│   ├── test_rag.py                # RAG pipeline unit tests
+│   └── test_pipeline.py          # Integration tests (fully mocked)
 ├── Dockerfile.vibevoice           # VibeVoice vLLM container image
 ├── vibevoice_entrypoint.sh        # Container startup script
 ├── docker-compose.yml             # ChromaDB + VibeVoice services
