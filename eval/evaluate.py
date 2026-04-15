@@ -37,7 +37,7 @@ from deepeval.models import GPTModel
 from deepeval.synthesizer import Synthesizer
 from deepeval.test_case import LLMTestCase
 
-from config import VLLM_BASE_URL, VLLM_MODEL  # noqa: F401 — triggers load_dotenv()
+from config import OPENAI_API_KEY  # noqa: F401 — triggers load_dotenv()
 from pipeline.embed import get_chroma_collection, load_embedding_model
 from pipeline.rag import generate_answer, retrieve
 

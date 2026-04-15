@@ -25,14 +25,7 @@ from pipeline.rag import (
     resolve_speaker_names,
     retrieve,
 )
-from config import STT_BACKEND
-
-if STT_BACKEND == "parakeet":
-    from pipeline.transcribe_parakeet import load_stt_model, transcribe
-elif STT_BACKEND == "vibevoice_vllm":
-    from pipeline.transcribe_vibevoice_vllm import load_stt_model, transcribe
-else:
-    from pipeline.transcribe import load_stt_model, transcribe
+from pipeline.transcribe_vibevoice_vllm import load_stt_model, transcribe
 
 st.set_page_config(page_title="Echo", layout="wide", page_icon="🎙️")
 
@@ -75,13 +68,8 @@ def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict
         return None
 
     with st.status("Processing audio…", expanded=True) as status:
-        _backend_label = {
-            "parakeet": "Whisper Large V3 Turbo + pyannote",
-            "vibevoice_vllm": "VibeVoice-ASR (vLLM)",
-        }.get(STT_BACKEND, "VibeVoice-ASR")
-
         try:
-            st.write(f"Transcribing with {_backend_label}…")
+            st.write("Transcribing with VibeVoice-ASR…")
             segments = transcribe(audio_path, _stt_model())
             st.write(f"Transcription done — {len(segments)} segments.")
         except Exception as e:

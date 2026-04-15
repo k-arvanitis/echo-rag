@@ -24,13 +24,27 @@ if [ ! -f "$MODEL_PATH/tokenizer.json" ]; then
     python3 -m vllm_plugin.tools.generate_tokenizer_files --output "$MODEL_PATH"
 fi
 
+# Patch config.json so the processor loads the tokenizer from the local model dir
+# instead of downloading Qwen/Qwen2.5-7B from HuggingFace Hub.
+python3 - <<PYEOF
+import json, sys
+path = "$MODEL_PATH/config.json"
+with open(path) as f:
+    cfg = json.load(f)
+if cfg.get("language_model_pretrained_name") != "$MODEL_PATH":
+    cfg["language_model_pretrained_name"] = "$MODEL_PATH"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("[vibevoice] patched config.json: language_model_pretrained_name -> $MODEL_PATH")
+PYEOF
+
 echo "[vibevoice] starting vLLM on port $PORT (gpu_util=$GPU_UTIL)"
 exec vllm serve "$MODEL_PATH" \
     --served-model-name vibevoice \
     --trust-remote-code \
     --dtype bfloat16 \
     --max-num-seqs 16 \
-    --max-model-len 65536 \
+    --max-model-len 32768 \
     --gpu-memory-utilization "$GPU_UTIL" \
     --no-enable-prefix-caching \
     --enable-chunked-prefill \

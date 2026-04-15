@@ -1,32 +1,5 @@
 services:
-  vllm:
-    image: vllm/vllm-openai:latest
-    ports:
-      - "${VLLM_PORT:-8000}:8000"
-    volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-    environment:
-      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
-      HF_HUB_OFFLINE: "1"
-    command: [
-      "--model", "${VLLM_MODEL:-Qwen/Qwen3-8B}",
-      "--served-model-name", "${VLLM_MODEL:-Qwen/Qwen3-8B}",
-      "--dtype", "auto",
-      "--gpu-memory-utilization", "0.10",
-      "--max-model-len", "8192"
-    ]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    ipc: host
-    restart: unless-stopped
-
   vibevoice:
-    profiles: [vibevoice]
     build:
       context: .
       dockerfile: Dockerfile.vibevoice
