@@ -1,4 +1,4 @@
-"""Streamlit UI: upload audio → transcribe → query with speaker-aware RAG."""
+"""Streamlit UI: upload audio → transcribe → name speakers → query with speaker-aware RAG."""
 import os
 import tempfile
 import uuid
@@ -59,15 +59,17 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict] | None:
-    """Run the full pipeline. Returns (segments, summary, show_notes) or None on failure."""
-    try:
-        collection = _collection()
-    except RuntimeError as e:
-        st.error(str(e))
-        return None
+# ---------------------------------------------------------------------------
+# Pipeline phases
+# ---------------------------------------------------------------------------
 
-    with st.status("Processing audio…", expanded=True) as status:
+def run_transcription(audio_path: str) -> tuple[list[dict], dict[str, str]] | None:
+    """Phase 1: transcribe and collect speaker name suggestions.
+
+    Returns (raw_segments, suggested_name_map) or None on failure.
+    suggested_name_map maps speaker_id → suggested display name.
+    """
+    with st.status("Transcribing…", expanded=True) as status:
         try:
             st.write("Transcribing with VibeVoice-ASR…")
             segments = transcribe(audio_path, _stt_model())
@@ -78,15 +80,88 @@ def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict
             return None
 
         try:
-            st.write("Identifying speakers…")
-            name_map = resolve_speaker_names(segments)
-            for s in segments:
-                s["speaker"] = name_map.get(s["speaker"], s["speaker"])
-            st.write(f"Speakers: {', '.join(name_map.values())}")
+            st.write("Suggesting speaker names…")
+            suggested = resolve_speaker_names(segments)
+            st.write(f"Detected {len(suggested)} speaker(s).")
         except Exception as e:
-            st.warning(f"Speaker name resolution skipped: {e}")
-            name_map = {}
+            st.warning(f"Speaker suggestion skipped: {e}")
+            speakers = sorted({s["speaker"] for s in segments})
+            suggested = {spk: spk for spk in speakers}
 
+        status.update(
+            label="Transcription complete — name your speakers below",
+            state="complete",
+            expanded=False,
+        )
+
+    return segments, suggested
+
+
+def render_speaker_naming_form(
+    segments: list[dict],
+    suggested: dict[str, str],
+) -> dict[str, str] | None:
+    """Show a form mapping speaker IDs to display names.
+
+    Each speaker gets a 200-char preview of their speech and a text input
+    pre-filled with the LLM-suggested name. Returns the final name map on
+    submit, or None while the form is still open.
+    """
+    # Build first-200-char preview per speaker_id
+    previews: dict[str, str] = {}
+    for s in segments:
+        spk = s["speaker"]
+        if spk not in previews:
+            previews[spk] = ""
+        if len(previews[spk]) < 200:
+            previews[spk] += s["text"] + " "
+
+    st.subheader("Name your speakers")
+    st.caption(
+        "Review each speaker's opening words and assign a display name. "
+        "Leave blank to keep the suggested label."
+    )
+
+    with st.form("speaker_naming_form"):
+        inputs: dict[str, str] = {}
+        for spk_id in sorted(previews):
+            preview = previews[spk_id][:200].strip()
+            col_preview, col_input = st.columns([3, 1])
+            with col_preview:
+                st.markdown(f"**{suggested.get(spk_id, spk_id)}**")
+                st.caption(f'"{preview}…"')
+            with col_input:
+                inputs[spk_id] = st.text_input(
+                    "Display name",
+                    value=suggested.get(spk_id, ""),
+                    key=f"spk_{spk_id}",
+                    label_visibility="collapsed",
+                    placeholder=suggested.get(spk_id, spk_id),
+                )
+
+        submitted = st.form_submit_button("Continue →", type="primary")
+
+    if submitted:
+        return {
+            spk_id: name.strip() if name.strip() else suggested.get(spk_id, spk_id)
+            for spk_id, name in inputs.items()
+        }
+    return None
+
+
+def run_pipeline(segments: list[dict], filename: str) -> tuple[str, dict] | None:
+    """Phase 2: chunk, summarize, generate show notes, embed into ChromaDB.
+
+    Segments must already have display names applied before calling this.
+    Returns (summary, show_notes) or None on failure.
+    """
+    try:
+        collection = _collection()
+    except RuntimeError as e:
+        st.error(str(e))
+        return None
+
+    with st.status("Processing…", expanded=True) as status:
         st.write("Chunking transcript…")
         chunks = chunk_transcript(segments)
         st.write(f"Chunking done — {len(chunks)} chunks.")
@@ -121,8 +196,12 @@ def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict
 
         status.update(label="Done!", state="complete", expanded=False)
 
-    return segments, summary, show_notes
+    return summary, show_notes
 
+
+# ---------------------------------------------------------------------------
+# Render helpers
+# ---------------------------------------------------------------------------
 
 def render_show_notes(show_notes: dict) -> None:
     chapters = show_notes.get("chapters", [])
@@ -195,7 +274,12 @@ def render_sidebar() -> None:
             col1, col2 = st.columns(2)
             if col1.button("Yes, clear", type="primary"):
                 clear_collection(_collection())
-                for key in ["segments", "summary", "show_notes", "last_filename", "audio_bytes", "confirm_clear"]:
+                for key in [
+                    "segments", "summary", "show_notes",
+                    "last_filename", "audio_bytes",
+                    "raw_segments", "suggested_names", "pipeline_stage",
+                    "confirm_clear",
+                ]:
                     st.session_state.pop(key, None)
                 st.success("Cleared.")
                 st.rerun()
@@ -206,6 +290,10 @@ def render_sidebar() -> None:
     return uploaded
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     # Assign a unique ID per browser session for collection isolation
     if "user_id" not in st.session_state:
@@ -215,28 +303,60 @@ def main() -> None:
 
     if uploaded is not None:
         if st.session_state.get("last_filename") != uploaded.name:
+            # New file — clear prior state and run phase 1 (transcription only)
+            for key in ["segments", "summary", "show_notes", "raw_segments", "suggested_names", "pipeline_stage"]:
+                st.session_state.pop(key, None)
+
             suffix = os.path.splitext(uploaded.name)[1]
             audio_bytes = uploaded.read()
             st.session_state["audio_bytes"] = audio_bytes
+
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
 
             try:
-                result = process_audio(tmp_path, uploaded.name)
+                result = run_transcription(tmp_path)
             finally:
                 os.unlink(tmp_path)
 
             if result is None:
-                return  # error already shown by process_audio
+                return
 
-            segments, summary, show_notes = result
-            st.session_state["segments"] = segments
-            st.session_state["summary"] = summary
-            st.session_state["show_notes"] = show_notes
+            segments, suggested = result
+            st.session_state["raw_segments"] = segments
+            st.session_state["suggested_names"] = suggested
             st.session_state["last_filename"] = uploaded.name
+            st.session_state["pipeline_stage"] = "awaiting_names"
+            st.rerun()
+
+        elif st.session_state.get("pipeline_stage") == "awaiting_names":
+            # Phase 1.5: naming form — block until user confirms speaker names
+            name_map = render_speaker_naming_form(
+                st.session_state["raw_segments"],
+                st.session_state["suggested_names"],
+            )
+            if name_map is not None:
+                # Apply display names to segments in-place, then run phase 2
+                segments = st.session_state["raw_segments"]
+                for s in segments:
+                    s["speaker"] = name_map.get(s["speaker"], s["speaker"])
+
+                result = run_pipeline(segments, uploaded.name)
+                if result is None:
+                    return
+
+                summary, show_notes = result
+                st.session_state["segments"] = segments
+                st.session_state["summary"] = summary
+                st.session_state["show_notes"] = show_notes
+                st.session_state["pipeline_stage"] = "complete"
+                st.rerun()
+
+            return  # don't render tabs while the naming form is open
 
         elif "summary" not in st.session_state:
+            # Same filename in a fresh page session — load cached results from ChromaDB
             collection = _collection()
             st.session_state["summary"] = get_summary(collection, uploaded.name)
             st.session_state["show_notes"] = get_show_notes(collection, uploaded.name)
