@@ -4,7 +4,9 @@
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![ChromaDB](https://img.shields.io/badge/ChromaDB-FF6B35?style=for-the-badge&logoColor=white)
 
-<!-- demo: replace with a screen recording or YouTube link -->
+
+https://github.com/user-attachments/assets/25a15728-b5fb-4471-ba13-a06e42234328
+
 
 # Echo — Meeting Intelligence
 
