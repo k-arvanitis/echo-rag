@@ -25,7 +25,14 @@ from pipeline.rag import (
     resolve_speaker_names,
     retrieve,
 )
-from pipeline.transcribe import load_stt_model, transcribe
+from config import STT_BACKEND
+
+if STT_BACKEND == "parakeet":
+    from pipeline.transcribe_parakeet import load_stt_model, transcribe
+elif STT_BACKEND == "vibevoice_vllm":
+    from pipeline.transcribe_vibevoice_vllm import load_stt_model, transcribe
+else:
+    from pipeline.transcribe import load_stt_model, transcribe
 
 st.set_page_config(page_title="Echo", layout="wide", page_icon="🎙️")
 
@@ -40,12 +47,12 @@ header {visibility: hidden;}
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def _stt_model():
     return load_stt_model()
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def _embedding_model():
     return load_embedding_model()
 
@@ -59,37 +66,70 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict]:
-    collection = _collection()
+def process_audio(audio_path: str, filename: str) -> tuple[list[dict], str, dict] | None:
+    """Run the full pipeline. Returns (segments, summary, show_notes) or None on failure."""
+    try:
+        collection = _collection()
+    except RuntimeError as e:
+        st.error(str(e))
+        return None
 
     with st.status("Processing audio…", expanded=True) as status:
-        st.write("Transcribing with VibeVoice-ASR…")
-        segments = transcribe(audio_path, _stt_model())
-        st.write(f"Transcription done — {len(segments)} segments.")
+        _backend_label = {
+            "parakeet": "Whisper Large V3 Turbo + pyannote",
+            "vibevoice_vllm": "VibeVoice-ASR (vLLM)",
+        }.get(STT_BACKEND, "VibeVoice-ASR")
 
-        st.write("Identifying speakers…")
-        name_map = resolve_speaker_names(segments)
-        for s in segments:
-            s["speaker"] = name_map.get(s["speaker"], s["speaker"])
-        st.write(f"Speakers: {', '.join(name_map.values())}")
+        try:
+            st.write(f"Transcribing with {_backend_label}…")
+            segments = transcribe(audio_path, _stt_model())
+            st.write(f"Transcription done — {len(segments)} segments.")
+        except Exception as e:
+            status.update(label="Transcription failed", state="error")
+            st.error(f"Transcription error: {e}")
+            return None
+
+        try:
+            st.write("Identifying speakers…")
+            name_map = resolve_speaker_names(segments)
+            for s in segments:
+                s["speaker"] = name_map.get(s["speaker"], s["speaker"])
+            st.write(f"Speakers: {', '.join(name_map.values())}")
+        except Exception as e:
+            st.warning(f"Speaker name resolution skipped: {e}")
+            name_map = {}
 
         st.write("Chunking transcript…")
         chunks = chunk_transcript(segments)
         st.write(f"Chunking done — {len(chunks)} chunks.")
 
-        st.write("Generating summary…")
-        summary = generate_summary(segments)
-        st.write("Summary ready.")
+        try:
+            st.write("Generating summary…")
+            summary = generate_summary(segments)
+            st.write("Summary ready.")
+        except RuntimeError as e:
+            status.update(label="Failed", state="error")
+            st.error(str(e))
+            return None
 
-        st.write("Generating show notes…")
-        show_notes = generate_show_notes(chunks)
-        st.write(f"Show notes ready — {len(show_notes.get('chapters', []))} chapters.")
+        try:
+            st.write("Generating show notes…")
+            show_notes = generate_show_notes(chunks)
+            st.write(f"Show notes ready — {len(show_notes.get('chapters', []))} chapters.")
+        except RuntimeError as e:
+            st.warning(f"Show notes skipped: {e}")
+            show_notes = {}
 
-        st.write(f"Ingesting {len(chunks)} chunks into ChromaDB…")
-        embed_chunks(chunks, collection, _embedding_model(), audio_filename=filename)
-        store_summary(summary, collection, _embedding_model(), audio_filename=filename)
-        store_show_notes(show_notes, collection, audio_filename=filename)
-        st.write("Ingestion complete.")
+        try:
+            st.write(f"Ingesting {len(chunks)} chunks into ChromaDB…")
+            embed_chunks(chunks, collection, _embedding_model(), audio_filename=filename)
+            store_summary(summary, collection, _embedding_model(), audio_filename=filename)
+            store_show_notes(show_notes, collection, audio_filename=filename)
+            st.write("Ingestion complete.")
+        except RuntimeError as e:
+            status.update(label="Ingestion failed", state="error")
+            st.error(str(e))
+            return None
 
         status.update(label="Done!", state="complete", expanded=False)
 
@@ -193,9 +233,13 @@ def main() -> None:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
 
-            segments, summary, show_notes = process_audio(tmp_path, uploaded.name)
+            result = process_audio(tmp_path, uploaded.name)
             os.unlink(tmp_path)
 
+            if result is None:
+                return  # error already shown by process_audio
+
+            segments, summary, show_notes = result
             st.session_state["segments"] = segments
             st.session_state["summary"] = summary
             st.session_state["show_notes"] = show_notes
@@ -234,8 +278,11 @@ def main() -> None:
             st.info("Transcript not available — re-upload the file to generate it.")
 
     with tab_ask:
-        query = st.text_input("Ask anything about this podcast", placeholder="Who spoke more? What was the main argument?")
-        if query and st.button("Ask", type="primary"):
+        with st.form("ask_form", border=False):
+            query = st.text_input("Ask anything about this podcast", placeholder="Who spoke more? What was the main argument?")
+            submitted = st.form_submit_button("Ask", type="primary")
+
+        if submitted and query:
             intent = classify_intent(query)
 
             if intent == "summary":
@@ -262,10 +309,13 @@ def main() -> None:
                     st.info("Re-upload the file to compute speaker stats.")
 
             else:
-                chunks = retrieve(query, _collection(), _embedding_model())
-                with st.container(border=True):
-                    answer = st.write_stream(generate_answer_stream(query, chunks))
-                render_answer(answer, chunks)
+                try:
+                    chunks = retrieve(query, _collection(), _embedding_model())
+                    with st.container(border=True):
+                        answer = st.write_stream(generate_answer_stream(query, chunks))
+                    render_answer(answer, chunks)
+                except RuntimeError as e:
+                    st.error(str(e))
 
 
 if __name__ == "__main__":

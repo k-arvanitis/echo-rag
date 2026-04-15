@@ -1,15 +1,24 @@
 """Embed speaker-turn chunks and store them in ChromaDB (HTTP server mode)."""
 import json
+import logging
 
 import chromadb
+
+logger = logging.getLogger(__name__)
 from sentence_transformers import SentenceTransformer
 
 from config import CHROMA_HOST, CHROMA_PORT, EMBEDDING_MODEL
 
 def get_chroma_collection(user_id: str = "default") -> chromadb.Collection:
     """Connect to the ChromaDB server and return (or create) a per-user collection."""
-    client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-    return client.get_or_create_collection(f"audio_rag_{user_id}")
+    try:
+        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        return client.get_or_create_collection(f"audio_rag_{user_id}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot connect to ChromaDB at {CHROMA_HOST}:{CHROMA_PORT}. "
+            "Is the server running? Try: docker compose up -d chroma"
+        ) from e
 
 
 def load_embedding_model(model_name: str = EMBEDDING_MODEL) -> SentenceTransformer:
@@ -39,6 +48,7 @@ def embed_chunks(
     ]
 
     collection.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    logger.info("upserted %d chunks for %s", len(chunks), audio_filename)
 
 
 def store_summary(

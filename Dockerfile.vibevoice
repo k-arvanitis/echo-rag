@@ -1,0 +1,13 @@
+FROM vllm/vllm-openai:v0.14.1
+
+# Audio processing deps
+RUN apt-get update && apt-get install -y ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+
+# Install VibeVoice plugin (with vLLM extras)
+COPY vibevoice_repo/ /app/
+RUN pip install -e /app[vllm] --quiet
+
+COPY vibevoice_entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

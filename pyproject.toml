@@ -20,6 +20,8 @@ dependencies = [
     # Audio I/O
     "soundfile==0.12.1",
     "librosa>=0.10.0",
+    # Diarization (Parakeet backend)
+    "pyannote.audio>=3.3.0",
     # Utilities
     "python-dotenv==1.0.1",
     "numpy>=1.26.0",
@@ -50,6 +52,11 @@ package = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
+
+[tool.pytest.ini_options]
+addopts = [
+    "--ignore=vibevoice_repo/vllm_plugin/tests",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

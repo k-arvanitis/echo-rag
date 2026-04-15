@@ -12,6 +12,9 @@ load_dotenv()
 # --- HuggingFace (optional — used if the model repo is private or rate-limited) ---
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")
 
+# --- STT backend: "parakeet" (default), "vibevoice_vllm", or "vibevoice" ---
+STT_BACKEND: str = os.getenv("STT_BACKEND", "parakeet")
+
 # --- STT (VibeVoice-ASR: single-pass transcription + diarization + timestamps) ---
 STT_MODEL: str = os.getenv("STT_MODEL", "microsoft/VibeVoice-ASR")
 # Tokenizer backbone used by VibeVoice-ASR processor when tokenizer files are
@@ -34,6 +37,21 @@ MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "512"))
 
 # --- RAG ---
 TOP_K_RESULTS: int = int(os.getenv("TOP_K_RESULTS", "5"))
+
+# --- VibeVoice vLLM backend ---
+VIBEVOICE_VLLM_URL: str = os.getenv("VIBEVOICE_VLLM_URL", "http://localhost:8001/v1")
+
+# --- Parakeet backend model IDs ---
+WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
+# pyannote/speaker-diarization-3.1 requires accepting the licence at huggingface.co/pyannote
+# AND huggingface.co/pyannote/segmentation-3.0 before first use.
+DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
+
+# --- Diarization (parakeet backend) ---
+# Set expected speaker count to prevent pyannote from drifting to new labels mid-episode.
+# Leave as 0 to let pyannote decide automatically.
+DIARIZATION_MIN_SPEAKERS: int = int(os.getenv("DIARIZATION_MIN_SPEAKERS", "0"))
+DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "0"))
 
 # --- Chunking ---
 # Max characters per chunk. Turns are never split; a single oversized turn becomes its own chunk.

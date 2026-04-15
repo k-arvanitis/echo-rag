@@ -4,9 +4,17 @@ VibeVoice-ASR processes up to 60 min of audio in one forward pass and returns
 structured segments with speaker ID and timestamps — no separate diarization
 model required.
 """
+import logging
+import re
+import tempfile
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
+import librosa
 import soundfile as sf
+
+_TARGET_SR = 16_000  # VibeVoice-ASR expects 16kHz mono
 from huggingface_hub import hf_hub_download
 
 from config import STT_LANGUAGE_MODEL, STT_MAX_NEW_TOKENS, STT_MODEL
@@ -165,7 +173,7 @@ def _generate(processor: Any, model: Any, audio_path: str) -> list[dict]:
     # don't have a reliable .device attribute and can silently return cpu.
     model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
-    print(f"[stt] device={model_device} dtype={model_dtype} audio={audio_path}")
+    logger.info("device=%s dtype=%s audio=%s", model_device, model_dtype, audio_path)
 
     def _prepare_inputs_for_model(batch: Any) -> Any:
         prepared = {}
@@ -196,7 +204,7 @@ def _generate(processor: Any, model: Any, audio_path: str) -> list[dict]:
         )
 
     inputs = _prepare_inputs_for_model(inputs)
-    print(f"[stt] inputs on: { {k: v.device if hasattr(v, 'device') else type(v).__name__ for k, v in inputs.items()} }")
+    logger.debug("inputs on: %s", {k: v.device if hasattr(v, "device") else type(v).__name__ for k, v in inputs.items()})
 
     tok = processor.tokenizer
     eos_id = tok.eos_token_id
@@ -213,7 +221,7 @@ def _generate(processor: Any, model: Any, audio_path: str) -> list[dict]:
         num_beams=1,
     )
 
-    print(f"[stt] generate took {time.time() - t0:.1f}s")
+    logger.info("generate took %.1fs", time.time() - t0)
     n_input = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
     generated_ids = output_ids[:, n_input:]
 
@@ -232,27 +240,86 @@ def _generate(processor: Any, model: Any, audio_path: str) -> list[dict]:
     return processor.post_process_transcription(raw_text)
 
 
+_NON_SPEECH = re.compile(
+    r"^\[(?:music|silence|noise|applause|laughter|inaudible|crosstalk|sound|"
+    r"background music|background noise)\]$",
+    re.IGNORECASE,
+)
+
+# VibeVoice-ASR supports up to 60 min, but KV cache for 30 min already uses ~12 GB.
+# Chunking at 25 min keeps peak GPU memory manageable when vLLM is also loaded.
+_CHUNK_SECONDS = 25 * 60
+
+
+def _parse_segments(raw_segments: list[dict], time_offset: float = 0.0) -> list[dict]:
+    """Normalise raw segment dicts, apply a timestamp offset, and drop non-speech."""
+    segments = []
+    for seg in raw_segments:
+        text = str(seg.get("text", seg.get("Content", ""))).strip()
+        if not text or _NON_SPEECH.match(text):
+            continue
+        segments.append({
+            "speaker": str(seg.get("speaker_id", seg.get("Speaker", ""))),
+            "start": round(float(seg.get("start_time", seg.get("Start", 0.0))) + time_offset, 2),
+            "end": round(float(seg.get("end_time", seg.get("End", 0.0))) + time_offset, 2),
+            "text": text,
+        })
+    return segments
+
+
 def transcribe(
     audio_path: str,
     stt_model: tuple[Any, Any] | None = None,
 ) -> list[dict]:
-    """Transcribe audio in a single pass. Returns [{speaker, start, end, text}].
+    """Transcribe audio, chunking into 25-min segments to stay within GPU memory.
 
+    Returns [{speaker, start, end, text}] with timestamps relative to the full file.
     Pass a pre-loaded (processor, model) tuple to avoid reloading between calls.
     """
     if stt_model is None:
         stt_model = load_stt_model()
     processor, model = stt_model
 
-    raw_segments = _generate(processor, model, audio_path)
+    audio, sr = sf.read(audio_path)
+    # Convert to mono and resample to 16kHz — the model's native rate.
+    # Avoids processing unnecessary data (44.1kHz stereo = ~5x more than needed).
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != _TARGET_SR:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=_TARGET_SR)
+        sr = _TARGET_SR
+    duration = len(audio) / sr
 
-    return [
-        {
-            "speaker": str(seg.get("speaker_id", seg.get("Speaker", ""))),
-            "start": round(float(seg.get("start_time", seg.get("Start", 0.0))), 2),
-            "end": round(float(seg.get("end_time", seg.get("End", 0.0))), 2),
-            "text": str(seg.get("text", seg.get("Content", ""))).strip(),
-        }
-        for seg in raw_segments
-        if str(seg.get("text", seg.get("Content", ""))).strip()
-    ]
+    if duration <= _CHUNK_SECONDS:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, audio, sr)
+            resampled_path = tmp.name
+        try:
+            return _parse_segments(_generate(processor, model, resampled_path))
+        finally:
+            import os
+            os.unlink(resampled_path)
+
+    chunk_samples = int(_CHUNK_SECONDS * sr)
+    offsets = list(range(0, len(audio), chunk_samples))
+    n_chunks = len(offsets)
+    logger.info("audio is %.1f min — splitting into %d chunks", duration / 60, n_chunks)
+
+    all_segments: list[dict] = []
+    for i, offset in enumerate(offsets):
+        chunk = audio[offset: offset + chunk_samples]
+        time_offset = offset / sr
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, chunk, sr)
+            chunk_path = tmp.name
+
+        logger.info("chunk %d/%d at %.1f min", i + 1, n_chunks, time_offset / 60)
+        try:
+            raw = _generate(processor, model, chunk_path)
+            all_segments.extend(_parse_segments(raw, time_offset=time_offset))
+        finally:
+            import os
+            os.unlink(chunk_path)
+
+    return all_segments

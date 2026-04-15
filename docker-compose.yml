@@ -4,10 +4,41 @@ services:
     ports:
       - "${VLLM_PORT:-8000}:8000"
     volumes:
-      - huggingface_cache:/root/.cache/huggingface
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
     environment:
       HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
-    command: ["--model", "${VLLM_MODEL:-Qwen/Qwen3-8B}", "--dtype", "auto", "--gpu-memory-utilization", "0.55"]
+      HF_HUB_OFFLINE: "1"
+    command: [
+      "--model", "${VLLM_MODEL:-Qwen/Qwen3-8B}",
+      "--served-model-name", "${VLLM_MODEL:-Qwen/Qwen3-8B}",
+      "--dtype", "auto",
+      "--gpu-memory-utilization", "0.38",
+      "--max-model-len", "8192"
+    ]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped
+
+  vibevoice:
+    profiles: [vibevoice]
+    build:
+      context: .
+      dockerfile: Dockerfile.vibevoice
+    ports:
+      - "${VIBEVOICE_PORT:-8001}:8001"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+      VIBEVOICE_MODEL: "${VIBEVOICE_MODEL:-microsoft/VibeVoice-ASR}"
+      VIBEVOICE_PORT: "8001"
+      VIBEVOICE_GPU_UTIL: "${VIBEVOICE_GPU_UTIL:-0.30}"
     deploy:
       resources:
         reservations:
@@ -29,8 +60,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  huggingface_cache:
-    # Persists downloaded model weights across container restarts.
   chroma_data:
     # Named volume — data survives container restarts and re-creates.
     # To wipe all indexed audio: docker compose down -v

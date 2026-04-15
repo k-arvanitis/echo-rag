@@ -1,20 +1,21 @@
 """DeepEval evaluation for Echo RAG.
 
-Generates QA pairs from indexed chunks using DeepEval Synthesizer,
-runs them through the RAG pipeline, and scores with:
-  - Faithfulness       (is the answer grounded in the retrieved context?)
-  - Answer Relevancy   (does the answer address the question?)
-  - Contextual Precision (are the top chunks the most relevant ones?)
-  - Contextual Recall    (do the chunks contain what's needed to answer?)
+QA pairs are synthesized from indexed chunks using GPT-4o-mini,
+then the RAG pipeline answers them (using local vLLM), and GPT-4o-mini
+judges the results on four metrics:
+  - Faithfulness         (answer grounded in retrieved context?)
+  - Answer Relevancy     (answer addresses the question?)
+  - Contextual Precision (top chunks are the most relevant?)
+  - Contextual Recall    (chunks contain what's needed to answer?)
 
 Usage:
     # Generate QA pairs, run eval, print results
-    uv run python eval/evaluate.py --user-id <your-session-uuid>
+    uv run python eval/evaluate.py --user-id <session-uuid>
 
-    # Save generated QA pairs for inspection
+    # Also save generated QA pairs for inspection / re-use
     uv run python eval/evaluate.py --user-id <uuid> --save eval/qa_pairs.json
 
-    # Re-use saved QA pairs (skip synthesis)
+    # Skip synthesis, re-use saved QA pairs
     uv run python eval/evaluate.py --user-id <uuid> --dataset eval/qa_pairs.json
 """
 
@@ -32,43 +33,19 @@ from deepeval.metrics import (
     ContextualRecallMetric,
     FaithfulnessMetric,
 )
-from deepeval.models.base_model import DeepEvalBaseLLM
+from deepeval.models import GPTModel
 from deepeval.synthesizer import Synthesizer
 from deepeval.test_case import LLMTestCase
-from openai import OpenAI
 
-from config import VLLM_BASE_URL, VLLM_MODEL
+from config import VLLM_BASE_URL, VLLM_MODEL  # noqa: F401 — triggers load_dotenv()
 from pipeline.embed import get_chroma_collection, load_embedding_model
 from pipeline.rag import generate_answer, retrieve
 
-
-class LocalVLLM(DeepEvalBaseLLM):
-    """DeepEval-compatible wrapper around the local vLLM server."""
-
-    def __init__(self) -> None:
-        self._client = OpenAI(base_url=VLLM_BASE_URL, api_key="dummy")
-
-    def load_model(self):
-        return self._client
-
-    def generate(self, prompt: str, schema=None) -> str:
-        response = self._client.chat.completions.create(
-            model=VLLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.0,
-        )
-        return response.choices[0].message.content
-
-    async def a_generate(self, prompt: str, schema=None) -> str:
-        return self.generate(prompt)
-
-    def get_model_name(self) -> str:
-        return VLLM_MODEL
+JUDGE_MODEL = "gpt-4o-mini"
 
 
 def fetch_chunks(user_id: str) -> list[str]:
-    """Pull all RAG chunks from ChromaDB, excluding metadata-only docs."""
+    """Fetch all RAG chunk documents from ChromaDB, excluding metadata-only docs."""
     collection = get_chroma_collection(user_id)
     result = collection.get(include=["documents", "metadatas"])
     return [
@@ -78,10 +55,10 @@ def fetch_chunks(user_id: str) -> list[str]:
     ]
 
 
-def synthesize(chunks: list[str], model: LocalVLLM, n: int) -> list[dict]:
-    """Generate n QA pairs from chunks using DeepEval Synthesizer."""
-    synthesizer = Synthesizer(model=model)
-    # Each golden gets its own single-chunk context
+def synthesize(chunks: list[str], n: int) -> list[dict]:
+    """Generate n QA pairs from chunks using GPT-4o-mini via DeepEval Synthesizer."""
+    judge = GPTModel(model=JUDGE_MODEL)
+    synthesizer = Synthesizer(model=judge)
     goldens = synthesizer.generate_goldens_from_contexts(
         contexts=[[c] for c in chunks[:n]],
     )
@@ -91,11 +68,8 @@ def synthesize(chunks: list[str], model: LocalVLLM, n: int) -> list[dict]:
     ]
 
 
-def build_test_cases(
-    qa_pairs: list[dict],
-    user_id: str,
-) -> list[LLMTestCase]:
-    """Run RAG on each question and wrap as DeepEval test cases."""
+def build_test_cases(qa_pairs: list[dict], user_id: str) -> list[LLMTestCase]:
+    """Run each question through the RAG pipeline and wrap as DeepEval test cases."""
     collection = get_chroma_collection(user_id)
     emb_model = load_embedding_model()
     test_cases = []
@@ -116,13 +90,11 @@ def build_test_cases(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DeepEval for Echo RAG")
-    parser.add_argument("--user-id", required=True, help="Session UUID (shown in sidebar)")
+    parser.add_argument("--user-id", required=True, help="Session UUID (shown in app sidebar)")
     parser.add_argument("--dataset", help="Path to existing QA pairs JSON (skips synthesis)")
     parser.add_argument("--save", help="Path to save generated QA pairs JSON")
-    parser.add_argument("--n", type=int, default=20, help="Number of QA pairs to generate (default 20)")
+    parser.add_argument("--n", type=int, default=20, help="QA pairs to generate (default: 20)")
     args = parser.parse_args()
-
-    model = LocalVLLM()
 
     if args.dataset:
         print(f"Loading QA pairs from {args.dataset}")
@@ -131,11 +103,12 @@ def main() -> None:
     else:
         print("Fetching chunks from ChromaDB…")
         chunks = fetch_chunks(args.user_id)
-        print(f"Found {len(chunks)} chunks. Synthesizing {args.n} QA pairs…")
-        qa_pairs = synthesize(chunks, model, args.n)
+        print(f"Found {len(chunks)} chunks. Synthesizing {args.n} QA pairs with {JUDGE_MODEL}…")
+        qa_pairs = synthesize(chunks, args.n)
         print(f"Generated {len(qa_pairs)} QA pairs.")
 
     if args.save:
+        os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
         with open(args.save, "w") as f:
             json.dump(qa_pairs, f, indent=2, ensure_ascii=False)
         print(f"QA pairs saved to {args.save}")
@@ -143,14 +116,15 @@ def main() -> None:
     print(f"\nRunning RAG on {len(qa_pairs)} questions…")
     test_cases = build_test_cases(qa_pairs, args.user_id)
 
+    judge = GPTModel(model=JUDGE_MODEL)
     metrics = [
-        FaithfulnessMetric(model=model, threshold=0.7),
-        AnswerRelevancyMetric(model=model, threshold=0.7),
-        ContextualPrecisionMetric(model=model, threshold=0.7),
-        ContextualRecallMetric(model=model, threshold=0.7),
+        FaithfulnessMetric(model=judge, threshold=0.7),
+        AnswerRelevancyMetric(model=judge, threshold=0.7),
+        ContextualPrecisionMetric(model=judge, threshold=0.7),
+        ContextualRecallMetric(model=judge, threshold=0.7),
     ]
 
-    print("\nEvaluating…")
+    print(f"\nEvaluating with {JUDGE_MODEL}…")
     results = evaluate(test_cases, metrics, print_results=False)
 
     print("\n=== Results ===")
