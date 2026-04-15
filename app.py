@@ -222,8 +222,10 @@ def main() -> None:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
 
-            result = process_audio(tmp_path, uploaded.name)
-            os.unlink(tmp_path)
+            try:
+                result = process_audio(tmp_path, uploaded.name)
+            finally:
+                os.unlink(tmp_path)
 
             if result is None:
                 return  # error already shown by process_audio

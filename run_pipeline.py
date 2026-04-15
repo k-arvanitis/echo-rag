@@ -15,7 +15,7 @@ import json
 from pipeline.chunk import chunk_transcript
 from pipeline.embed import clear_collection, embed_chunks, get_chroma_collection, load_embedding_model
 from pipeline.rag import query_rag
-from pipeline.transcribe import load_stt_model, transcribe
+from pipeline.transcribe_vibevoice_vllm import load_stt_model, transcribe
 
 
 def _print_transcript(segments: list[dict]) -> None:

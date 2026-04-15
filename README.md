@@ -1,4 +1,4 @@
-# Echo — Meeting Intelligence RAG
+# Echo — Meeting Intelligence
 
 Query who said what across your recorded meetings, sales calls, and interviews. Speaker-aware retrieval with timestamps.
 
@@ -63,6 +63,10 @@ Audio file
                   (speakers, timestamps, audio links)
 ```
 
+### Why VibeVoice
+
+VibeVoice-ASR handles transcription and speaker diarization in a single model pass — no separate diarization pipeline, no timestamp alignment step, no pyannote dependency. Audio never leaves your machine.
+
 ## Setup
 
 ### 1. Prerequisites
@@ -77,7 +81,7 @@ Audio file
 ### 2. Clone and install
 
 ```bash
-git clone <repo-url> echo-rag
+git clone https://github.com/k-arvanitis/echo-rag
 cd echo-rag
 uv sync
 ```

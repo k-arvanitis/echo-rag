@@ -121,37 +121,13 @@ def _generate_hyde_query(query: str) -> str:
         return query
 
 
-def get_speakers(collection: chromadb.Collection) -> list[str]:
-    """Return a sorted list of unique speaker names present in the collection.
-
-    Skips meta documents (summary, show_notes). Speaker values that contain
-    multiple names joined by ', ' (multi-speaker chunks) are split so each
-    individual name appears in the result.
-    """
-    try:
-        result = collection.get(include=["metadatas"])
-    except Exception as e:
-        logger.warning("could not fetch speakers from ChromaDB: %s", e)
-        return []
-    speakers: set[str] = set()
-    for meta in result.get("metadatas") or []:
-        if meta.get("type") in ("summary", "show_notes"):
-            continue
-        for spk in meta.get("speaker", "").split(", "):
-            spk = spk.strip()
-            if spk:
-                speakers.add(spk)
-    return sorted(speakers)
-
-
 def retrieve(
     query: str,
     collection: chromadb.Collection,
     embedding_model: SentenceTransformer,
     top_k: int = TOP_K_RESULTS,
-    speaker_filter: list[str] | None = None,
 ) -> list[dict]:
-    """Embed query and return top-k chunks, with optional reranking and speaker filter.
+    """Embed query and return top-k chunks, with optional reranking.
 
     Pipeline:
       1. HyDE (if enabled): generate a hypothetical transcript excerpt and embed
@@ -161,9 +137,6 @@ def retrieve(
       3. Cross-encoder reranking (if enabled): re-score every (query, chunk) pair
          and sort by reranker score.  Falls back to embedding-distance order if the
          model failed to load.
-      4. Speaker filter: if `speaker_filter` is provided, only chunks whose
-         `speaker` metadata value is in the list are returned.  Applied at the
-         ChromaDB query level via a `where` clause.
     """
     # Step 1: optionally replace query with a hypothetical document for HyDE
     embed_text = _generate_hyde_query(query) if HYDE_ENABLED else query
@@ -171,14 +144,12 @@ def retrieve(
 
     # Step 2: fetch candidates — more than top_k when reranking is on
     fetch_k = max(_RERANKER_FETCH_K, top_k * 2) if RERANKER_ENABLED else top_k + 2
-    where = {"speaker": {"$in": speaker_filter}} if speaker_filter else None
 
     try:
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=fetch_k,
             include=["documents", "metadatas", "distances"],
-            where=where,
         )
     except Exception as e:
         raise RuntimeError(f"ChromaDB query failed: {e}") from e
@@ -294,22 +265,6 @@ def generate_summary(segments: list[dict]) -> str:
     return response.choices[0].message.content.strip()
 
 
-def classify_intent(query: str) -> str:
-    """Classify query intent using keyword matching. Returns 'summary', 'stats', or 'rag'."""
-    q = query.lower()
-    if any(k in q for k in [
-        "summarize", "summary", "what is this about", "what's this about",
-        "what is the podcast about", "overview", "tell me about this",
-    ]):
-        return "summary"
-    if any(k in q for k in [
-        "who spoke", "who talks", "speaking time", "talk time", "talked more",
-        "spoke more", "how long", "duration", "word count", "how many words", "pace",
-    ]):
-        return "stats"
-    return "rag"
-
-
 def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
     """Scan the intro of the transcript to map speaker IDs to real names.
 
@@ -369,38 +324,6 @@ def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
     except (json.JSONDecodeError, KeyError):
         logger.warning("could not parse speaker name JSON: %r", raw)
         return fallback
-
-
-def compute_stats(segments: list[dict]) -> dict:
-    """Compute episode stats directly from segments — no LLM needed."""
-    if not segments:
-        return {}
-
-    total_duration = max(s["end"] for s in segments)
-
-    speaker_time: dict[str, float] = {}
-    speaker_words: dict[str, int] = {}
-    for s in segments:
-        spk = s["speaker"]
-        speaker_time[spk] = speaker_time.get(spk, 0.0) + (s["end"] - s["start"])
-        speaker_words[spk] = speaker_words.get(spk, 0) + len(s["text"].split())
-
-    total_words = sum(speaker_words.values())
-
-    return {
-        "duration": round(total_duration),
-        "total_words": total_words,
-        "avg_pace_wpm": round(total_words / (total_duration / 60)) if total_duration else 0,
-        "speakers": [
-            {
-                "speaker": spk,
-                "talk_time": round(speaker_time[spk]),
-                "talk_pct": round(speaker_time[spk] / total_duration * 100, 1),
-                "words": speaker_words[spk],
-            }
-            for spk in sorted(speaker_time, key=lambda x: -speaker_time[x])
-        ],
-    }
 
 
 def _sample_chunks(chunks: list[dict]) -> list[dict]:

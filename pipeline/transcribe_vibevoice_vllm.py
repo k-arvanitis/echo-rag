@@ -70,7 +70,7 @@ def _audio_to_b64(audio_path: str) -> tuple[str, str]:
 
 def _call_api(audio_path: str, duration: float) -> list[dict]:
     """POST audio to VibeVoice vLLM and return raw parsed output."""
-    from openai import OpenAI
+    from openai import APIConnectionError, APIStatusError, OpenAI
 
     audio_b64, mime = _audio_to_b64(audio_path)
     data_url = f"data:{mime};base64,{audio_b64}"
@@ -82,26 +82,34 @@ def _call_api(audio_path: str, duration: float) -> list[dict]:
     )
 
     client = OpenAI(base_url=VIBEVOICE_VLLM_URL, api_key="dummy")
-    stream = client.chat.completions.create(
-        model="vibevoice",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that transcribes audio input into text output in JSON format.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio_url", "audio_url": {"url": data_url}},
-                    {"type": "text", "text": prompt},
-                ],
-            },
-        ],
-        max_tokens=None,
-        temperature=0.0,
-        top_p=1.0,
-        stream=True,
-    )
+    try:
+        stream = client.chat.completions.create(
+            model="vibevoice",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that transcribes audio input into text output in JSON format.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio_url", "audio_url": {"url": data_url}},
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
+            max_tokens=None,
+            temperature=0.0,
+            top_p=1.0,
+            stream=True,
+        )
+    except APIConnectionError as e:
+        raise RuntimeError(
+            f"Cannot reach VibeVoice at {VIBEVOICE_VLLM_URL}. "
+            "Is the container running? Try: docker compose up -d"
+        ) from e
+    except APIStatusError as e:
+        raise RuntimeError(f"VibeVoice API error: {e.status_code} — {e.message}") from e
 
     full_text = ""
     for chunk in stream:
@@ -118,11 +126,11 @@ def _parse_json(text: str) -> list[dict]:
     if "```json" in text:
         start = text.find("```json") + 7
         end = text.find("```", start)
-        text = text[start:end].strip()
+        text = text[start:end if end > start else len(text)].strip()
     elif "```" in text:
         start = text.find("```") + 3
         end = text.rfind("```")
-        text = text[start:end].strip()
+        text = text[start:end if end > start else len(text)].strip()
 
     # Locate the JSON array/object
     for opener in ("[", "{"):
