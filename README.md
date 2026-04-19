@@ -1,3 +1,5 @@
+<!-- TODO: update GitHub repo description manually in repo Settings > About to:
+"Meeting intelligence RAG — speaker-aware retrieval with timestamps, HyDE, cross-encoder reranking, VibeVoice-ASR (local single-pass STT+diarization), ChromaDB, Groq." -->
 [![CI](https://github.com/k-arvanitis/echo-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/k-arvanitis/echo-rag/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
@@ -7,6 +9,18 @@
 
 https://github.com/user-attachments/assets/25a15728-b5fb-4471-ba13-a06e42234328
 
+## Demo
+
+The recording above walks through the four main tabs generated automatically on upload:
+
+| Tab / Feature | What it demonstrates |
+|---|---|
+| Overview tab | Auto-generated 2-3 paragraph summary — main topics, key points, speaker attribution |
+| Show Notes tab | Timestamped chapters and notable quotes per speaker |
+| Transcript tab | Full speaker-labelled table, filterable and scrollable |
+| Ask tab | Free-form question — answer streams in real time, Sources expands to show retrieved chunks with speaker label, timestamp range, and inline audio player seeked to that exact moment |
+
+The inline audio player in Sources is seeked automatically to the timestamp of each retrieved chunk — clicking a source plays the exact moment in the recording that the answer is drawn from.
 
 # Echo — Meeting Intelligence
 
@@ -89,6 +103,20 @@ Audio file
 
 VibeVoice-ASR handles transcription and speaker diarization in a single model pass — no separate diarization pipeline, no timestamp alignment step, no pyannote dependency. Audio never leaves your machine.
 
+## Key Engineering Decisions
+
+**Single-pass ASR + diarization (VibeVoice-ASR)** — standard pipelines run a separate diarization model (pyannote) after transcription, then align speaker labels to timestamps in a post-processing step. VibeVoice outputs speaker IDs, timestamps, and text in one pass — no alignment step, no pyannote dependency, and no risk of diarization/transcription offset drift on long recordings.
+
+**Speaker-turn chunking over fixed-size chunking** — fixed-size chunking splits mid-sentence and mid-exchange, discarding the question that prompted an answer. Speaker-turn boundaries are the natural semantic unit in a conversation: each chunk is a coherent exchange. A character budget (≤1500 chars) groups consecutive turns without crossing speaker-change points.
+
+**Speaker naming before indexing** — without this step, every answer references anonymous speaker IDs ("SPEAKER_00 said X") rather than real names. The LLM scans the conversation opening to suggest names; a naming form lets you confirm or correct them before indexing. Names are baked into chunk metadata, so attribution is accurate across every answer and source citation.
+
+**HyDE for vague conversational queries** — embedding a raw question like "what did we commit to?" retrieves chunks containing the word "commit", not chunks describing commitments. HyDE prompts the LLM to write a short hypothetical transcript excerpt that would answer the question, then embeds that excerpt instead of the raw query — improving recall for abstract, paraphrased, or context-dependent questions. Toggleable via `HYDE_ENABLED` in `.env`.
+
+**Cross-encoder reranking after retrieval** — bi-encoder retrieval (bge-m3 cosine similarity) ranks by embedding proximity, which can surface topically-related chunks that don't actually answer the question. A cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores the top-k candidates by reading query and chunk together, reordering by relevance before passing context to the LLM. Toggleable via `RERANKER_ENABLED` in `.env`.
+
+**Per-session ChromaDB collection isolation** — each browser session gets its own ChromaDB collection scoped by session ID. Multiple users can upload and query different recordings simultaneously without index interference. Indexed data persists in the Docker volume across restarts; only the session reference is in-memory.
+
 ## Tech stack
 
 | Component | Role | Why |
@@ -152,6 +180,20 @@ uv run streamlit run app.py
 
 Open [http://localhost:8501](http://localhost:8501). Upload an audio file — transcription + indexing runs automatically.
 
+## Tests
+
+```bash
+uv run pytest tests/
+```
+
+All external services are fully mocked — no GPU, no running ChromaDB, no Groq API key required.
+
+| File | What it covers |
+|---|---|
+| `test_chunk.py` | Character-budget chunking, speaker-turn boundary preservation, edge cases (single turn, empty input) |
+| `test_rag.py` | HyDE toggle, retrieval formatting, speaker-labeled context assembly, Groq response handling |
+| `test_pipeline.py` | End-to-end integration: transcribe → chunk → embed → query, fully mocked |
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -192,3 +234,11 @@ echo-rag/
 ├── .env.example                   # Template — safe to commit
 └── .env                           # Local secrets — not committed
 ```
+
+## Known Limitations
+
+- **GPU hard requirement** — VibeVoice-ASR-7B requires ≥24 GB VRAM. The system cannot run on CPU or consumer GPUs. To demo without a GPU, replace the STT step with a hosted API (e.g. Groq Whisper) and remove the `Dockerfile.vibevoice` dependency.
+- **HyDE adds one LLM call per query** — at Groq's free-tier rate limits this occasionally adds latency under load. Disable with `HYDE_ENABLED=false` to trade recall quality for speed.
+- **Cross-encoder runs on CPU** — `ms-marco-MiniLM-L-6-v2` adds ~100–200ms per reranking pass. On large transcript libraries (50+ recordings) this becomes noticeable. A GPU-accelerated reranker or a lighter model (`ms-marco-TinyBERT-L-2-v2`) would reduce this.
+- **Session reference is in-memory** — ChromaDB collection names are scoped per browser session. Closing the tab loses the session reference, though indexed data persists in the Docker volume and can be re-associated manually.
+- **No multi-speaker audio in overlapping speech** — VibeVoice-ASR assigns one speaker label per segment. Crosstalk or simultaneous speech is attributed to one speaker only.
