@@ -60,6 +60,18 @@ Query who said what across your recorded meetings, sales calls, and interviews. 
 
 ## Architecture
 
+Yes — by "architecture diagram" I mean a proper figure. Add one exported PNG/SVG under `assets/` and embed it here later. Good options: Excalidraw, Figma, or diagrams.net.
+
+Suggested figure sections:
+- Upload + Streamlit session boundary
+- VibeVoice transcription service
+- Chunking + speaker naming
+- Embedding + Chroma indexing
+- Retrieval path: HyDE → ANN → reranker → Groq answer generation
+- Output surfaces: summary, show notes, transcript, ask tab
+
+Current text diagram:
+
 ```
 Audio file
     │
@@ -103,20 +115,141 @@ Audio file
 
 VibeVoice-ASR handles transcription and speaker diarization in a single model pass — no separate diarization pipeline, no timestamp alignment step, no pyannote dependency. Audio never leaves your machine.
 
-## Key Engineering Decisions
+## Constraints and Engineering Decisions
 
-**Single-pass ASR + diarization (VibeVoice-ASR)** — standard pipelines run a separate diarization model (pyannote) after transcription, then align speaker labels to timestamps in a post-processing step. VibeVoice outputs speaker IDs, timestamps, and text in one pass — no alignment step, no pyannote dependency, and no risk of diarization/transcription offset drift on long recordings.
+This project is intentionally framed as an engineering tradeoff exercise, not just a model demo. The interesting part was deciding what to optimize for under real constraints: long-form audio, speaker attribution, local-first processing, portfolio-grade UX, and a setup simple enough for reproducible demos.
 
-**Speaker-turn chunking over fixed-size chunking** — fixed-size chunking splits mid-sentence and mid-exchange, discarding the question that prompted an answer. Speaker-turn boundaries are the natural semantic unit in a conversation: each chunk is a coherent exchange. A character budget (≤1500 chars) groups consecutive turns without crossing speaker-change points.
+### 1. Constraint: speaker-aware retrieval had to be trustworthy, not just semantically plausible
 
-**Speaker naming before indexing** — without this step, every answer references anonymous speaker IDs ("SPEAKER_00 said X") rather than real names. The LLM scans the conversation opening to suggest names; a naming form lets you confirm or correct them before indexing. Names are baked into chunk metadata, so attribution is accurate across every answer and source citation.
+A generic transcript QA system can answer topical questions, but it often loses *who* said something and *when*. For meeting intelligence, that is the product.
 
-**HyDE for vague conversational queries** — embedding a raw question like "what did we commit to?" retrieves chunks containing the word "commit", not chunks describing commitments. HyDE prompts the LLM to write a short hypothetical transcript excerpt that would answer the question, then embeds that excerpt instead of the raw query — improving recall for abstract, paraphrased, or context-dependent questions. Toggleable via `HYDE_ENABLED` in `.env`.
+**Options considered**
+- Fixed-size chunking for simplicity
+- Post-hoc attribution after retrieval
+- Speaker-turn-aware chunking before indexing
 
-**Cross-encoder reranking after retrieval** — bi-encoder retrieval (bge-m3 cosine similarity) ranks by embedding proximity, which can surface topically-related chunks that don't actually answer the question. A cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores the top-k candidates by reading query and chunk together, reordering by relevance before passing context to the LLM. Toggleable via `RERANKER_ENABLED` in `.env`.
+**Decision**
+- Index speaker-turn-aware chunks and preserve speaker/timestamp metadata end-to-end.
 
-**Per-session ChromaDB collection isolation** — each browser session gets its own ChromaDB collection scoped by session ID. Multiple users can upload and query different recordings simultaneously without index interference. Indexed data persists in the Docker volume across restarts; only the session reference is in-memory.
+**Why this tradeoff was worth it**
+- It keeps the semantic unit aligned with the actual conversation structure.
+- It avoids answers that are topically relevant but lose attribution.
+- It makes source display much stronger in demos because every answer can point to a person and exact moment.
 
+### 2. Constraint: diarization alignment complexity would create more failure modes than value
+
+A common stack is ASR first, diarization second, then timestamp/speaker alignment. That is flexible, but it adds extra model orchestration and extra points of failure.
+
+**Options considered**
+- Separate ASR + diarization pipeline with post-processing alignment
+- Single-pass model that emits text, timestamps, and speaker IDs together
+
+**Decision**
+- Use VibeVoice-ASR via vLLM for single-pass transcription + diarization.
+
+**Why this tradeoff was worth it**
+- It removes a full alignment stage.
+- It reduces pipeline complexity for a demoable system.
+- It avoids transcription/diarization drift on long recordings.
+- The downside is higher hardware demand, which is acceptable for this project because correctness and architecture clarity mattered more than commodity-laptop portability.
+
+### 3. Constraint: long recordings exceed practical model context limits
+
+Meeting and interview recordings are often much longer than what a single transcription request should safely handle.
+
+**Options considered**
+- Truncate audio and optimize for short demos only
+- Push full recordings through one oversized request
+- Split deterministically, preserve offsets, and reassemble cleanly
+
+**Decision**
+- Chunk long audio into fixed-duration windows, transcribe each chunk, and reapply offsets during reconstruction.
+
+**Why this tradeoff was worth it**
+- It preserves correctness on long inputs.
+- It keeps failure domains smaller.
+- It created a clean place to optimize later; the implementation now streams chunk creation from disk instead of loading the entire recording into memory first, and uses bounded parallelism for the long-audio path.
+
+### 4. Constraint: vague conversational queries perform poorly with raw embedding lookup alone
+
+Questions like "what did we commit to?" or "what objections came up?" often do not lexically resemble the best answer span.
+
+**Options considered**
+- Plain dense retrieval only
+- Query expansion via HyDE
+- Heavier retrieval stack with more complex orchestration
+
+**Decision**
+- Use HyDE as a targeted retrieval enhancement, then rerank with a cross-encoder.
+
+**Why this tradeoff was worth it**
+- HyDE improves recall for abstract conversational queries.
+- The reranker improves precision before generation.
+- The cost is extra latency, but that is explicit and configurable via `HYDE_ENABLED` and `RERANKER_ENABLED`.
+- For a senior-level framing, this is an important point: retrieval quality was treated as a measurable systems problem, not delegated blindly to the LLM.
+
+### 5. Constraint: portfolio UX needed to feel product-like, not notebook-like
+
+A strong portfolio project has to demonstrate not just ML components, but the experience of using them.
+
+**Options considered**
+- CLI-only demo
+- Thin app layer with upload, review, transcript, and QA surfaces
+- A more custom frontend with higher implementation cost
+
+**Decision**
+- Use Streamlit to ship a usable end-to-end interface quickly.
+
+**Why this tradeoff was worth it**
+- It made it possible to demonstrate the full workflow: upload, transcription, speaker naming, summary, show notes, transcript browsing, and grounded QA.
+- It is not the final frontend architecture I would choose for production, but it was the right tool for maximizing product surface area per unit of implementation time.
+
+### 6. Constraint: multi-user isolation was needed without building a full auth/data model
+
+Even in demo mode, different users should not collide in the same vector index.
+
+**Options considered**
+- One shared collection for all sessions
+- Full user/account model
+- Lightweight per-session collection isolation
+
+**Decision**
+- Scope Chroma collections by session ID.
+
+**Why this tradeoff was worth it**
+- It prevents index interference with very little infrastructure.
+- It keeps the local demo simple.
+- The tradeoff is that session identity is ephemeral and not production-grade, which is acceptable because the architecture leaves room to swap this for durable user/job state later.
+
+### 7. Constraint: demo reproducibility mattered more than production-scale infrastructure
+
+The system needed to be easy to clone, run, and explain.
+
+**Options considered**
+- Managed vector DB and hosted transcription/generation stack
+- Fully local stack with minimal moving parts
+- Microservice-heavy deployment from day one
+
+**Decision**
+- Keep Chroma local, keep transcription local, and use Groq only for generation-oriented tasks.
+
+**Why this tradeoff was worth it**
+- It keeps the setup understandable and reproducible.
+- It makes the privacy boundary explicit: raw audio stays local, while transcript text is sent to Groq for summaries and answers.
+- It also makes the migration path clear: if stricter privacy is required, the generation layer can be swapped for a local endpoint.
+
+### What makes this senior-level work
+
+The value in this project is not that it uses many components. It is that each component exists because of a specific constraint, and each choice carries an explicit tradeoff.
+
+The system was designed around:
+- preserving attribution, not just topical relevance
+- reducing pipeline failure modes, not just maximizing modularity
+- handling long inputs safely, not just optimizing for the happy path
+- making retrieval quality a first-class concern
+- keeping the demo architecture small without pretending it is production-complete
+
+That framing is the difference between "I built an AI app" and "I made deliberate architecture decisions under product and systems constraints."
 ## Tech stack
 
 | Component | Role | Why |
@@ -180,6 +313,17 @@ uv run streamlit run app.py
 
 Open [http://localhost:8501](http://localhost:8501). Upload an audio file — transcription + indexing runs automatically.
 
+## Benchmarks
+
+Fill these in after you run your own measurements.
+
+| Scenario | Input size | Hardware | Latency | Notes |
+|---|---|---|---|---|
+| Full ingest | TODO | TODO | TODO | transcription + naming + chunking + indexing |
+| First query | TODO | TODO | TODO | includes HyDE + reranking |
+| Cached repeat query | TODO | TODO | TODO | same session, same prompt |
+| Long-audio ingest | TODO | TODO | TODO | multi-chunk transcription path |
+
 ## Tests
 
 ```bash
@@ -234,6 +378,21 @@ echo-rag/
 ├── .env.example                   # Template — safe to commit
 └── .env                           # Local secrets — not committed
 ```
+
+## Tradeoffs
+
+- **Streamlit over custom frontend** — faster demo velocity and lower integration cost, but less control over complex UX.
+- **ChromaDB over managed vector DB** — simple local setup and zero cloud dependency, but limited production-grade scaling and ops features.
+- **Groq for generation** — fast remote inference and simple API, but transcript text leaves the local machine unless swapped for local serving.
+- **HyDE + reranker enabled by default** — better recall and answer quality, but extra latency and cost per query.
+- **VibeVoice local transcription** — strong privacy and single-pass diarization, but high GPU requirements reduce portability.
+
+## Deployment notes
+
+- **Local demo mode** — run Streamlit + Docker services on one GPU workstation. This is the intended portfolio/demo setup.
+- **Semi-production path** — move Streamlit behind an auth layer, persist session/user metadata outside process memory, and run Chroma/VibeVoice as separate services.
+- **Production path** — split ingestion and query into separate services, add a job queue for long transcription runs, add durable object storage for uploads, and replace per-session in-memory state with persistent user/job state.
+- **Privacy-sensitive deployment** — replace Groq with a local LLM endpoint so transcript text never leaves your infrastructure.
 
 ## Known Limitations
 

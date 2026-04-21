@@ -29,3 +29,4 @@ lightning_logs/
 vibevoice_repo/
 
 vibevoice_enrtypoint.sh
+*.code-workspace

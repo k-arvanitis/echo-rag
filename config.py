@@ -27,6 +27,7 @@ MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "512"))
 
 # --- RAG ---
 TOP_K_RESULTS: int = int(os.getenv("TOP_K_RESULTS", "5"))
+QUERY_CACHE_ENABLED: bool = os.getenv("QUERY_CACHE_ENABLED", "true").lower() == "true"
 
 # --- VibeVoice vLLM backend ---
 VIBEVOICE_VLLM_URL: str = os.getenv("VIBEVOICE_VLLM_URL", "http://localhost:8001/v1")

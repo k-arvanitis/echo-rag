@@ -8,12 +8,15 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 import streamlit as st
 
 from pipeline.chunk import chunk_transcript
+from concurrent.futures import ThreadPoolExecutor
+
 from pipeline.embed import (
     clear_collection,
     embed_chunks,
     get_chroma_collection,
     get_show_notes,
     get_summary,
+    is_audio_indexed,
     load_embedding_model,
     store_show_notes,
     store_summary,
@@ -150,11 +153,7 @@ def render_speaker_naming_form(
 
 
 def run_pipeline(segments: list[dict], filename: str) -> tuple[str, dict] | None:
-    """Phase 2: chunk, summarize, generate show notes, embed into ChromaDB.
-
-    Segments must already have display names applied before calling this.
-    Returns (summary, show_notes) or None on failure.
-    """
+    """Phase 2: chunk, summarize, generate show notes, embed into ChromaDB."""
     try:
         collection = _collection()
     except RuntimeError as e:
@@ -167,25 +166,25 @@ def run_pipeline(segments: list[dict], filename: str) -> tuple[str, dict] | None
         st.write(f"Chunking done — {len(chunks)} chunks.")
 
         try:
-            st.write("Generating summary…")
-            summary = generate_summary(segments)
+            st.write("Generating summary and show notes…")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                summary_future = executor.submit(generate_summary, segments)
+                show_notes_future = executor.submit(generate_show_notes, chunks)
+                summary = summary_future.result()
+                show_notes = show_notes_future.result()
             st.write("Summary ready.")
+            st.write(f"Show notes ready — {len(show_notes.get('chapters', []))} chapters.")
         except RuntimeError as e:
             status.update(label="Failed", state="error")
             st.error(str(e))
             return None
 
         try:
-            st.write("Generating show notes…")
-            show_notes = generate_show_notes(chunks)
-            st.write(f"Show notes ready — {len(show_notes.get('chapters', []))} chapters.")
-        except RuntimeError as e:
-            st.warning(f"Show notes skipped: {e}")
-            show_notes = {}
-
-        try:
-            st.write(f"Ingesting {len(chunks)} chunks into ChromaDB…")
-            embed_chunks(chunks, collection, _embedding_model(), audio_filename=filename)
+            if is_audio_indexed(collection, filename):
+                st.write("Audio already indexed — updating summary and show notes only.")
+            else:
+                st.write(f"Ingesting {len(chunks)} chunks into ChromaDB…")
+                embed_chunks(chunks, collection, _embedding_model(), audio_filename=filename)
             store_summary(summary, collection, _embedding_model(), audio_filename=filename)
             store_show_notes(show_notes, collection, audio_filename=filename)
             st.write("Ingestion complete.")
@@ -303,6 +302,7 @@ def main() -> None:
 
     if uploaded is not None:
         if st.session_state.get("last_filename") != uploaded.name:
+            st.info(f"Processing upload: {uploaded.name}")
             # New file — clear prior state and run phase 1 (transcription only)
             for key in ["segments", "summary", "show_notes", "raw_segments", "suggested_names", "pipeline_stage"]:
                 st.session_state.pop(key, None)
@@ -395,6 +395,7 @@ def main() -> None:
 
         if submitted and query:
             try:
+                st.info(f"Running retrieval for query: {query}")
                 chunks = retrieve(query, _collection(), _embedding_model())
                 with st.container(border=True):
                     answer = st.write_stream(generate_answer_stream(query, chunks))

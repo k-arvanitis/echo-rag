@@ -17,6 +17,7 @@ from config import (
     HYDE_ENABLED,
     LLM_MODEL,
     MAX_TOKENS,
+    QUERY_CACHE_ENABLED,
     RERANKER_ENABLED,
     RERANKER_MODEL,
     TOP_K_RESULTS,
@@ -28,6 +29,8 @@ _RERANKER_FETCH_K = 10
 
 # Module-level reranker instance — loaded once on first retrieval call.
 _reranker: Any = None
+_client: OpenAI | None = None
+_query_cache: dict[tuple[str, str], list[dict]] = {}
 
 _SYSTEM_PROMPT = (
     "You are an assistant that answers questions about audio transcripts. "
@@ -58,8 +61,40 @@ Rules:
 
 
 def _build_openai_client() -> OpenAI:
-    """Create an OpenAI-compatible client pointed at the Groq API."""
-    return OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
+    """Create and cache an OpenAI-compatible client pointed at the Groq API."""
+    global _client
+    if _client is None:
+        _client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
+    return _client
+
+
+def _chat_completion(
+    *,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None,
+    temperature: float,
+    stream: bool = False,
+):
+    """Send a chat completion request to Groq with shared error handling."""
+    from openai import APIConnectionError, APIStatusError
+
+    client = _build_openai_client()
+    try:
+        return client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+        )
+    except APIConnectionError as e:
+        raise RuntimeError("Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
+    except APIStatusError as e:
+        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
+
+
+def _completion_text(response) -> str:
+    return response.choices[0].message.content.strip()
 
 # ~4500 tokens; leaves room for system prompt + response within 8k context
 _SHOW_NOTES_CHAR_BUDGET = 18_000
@@ -87,19 +122,9 @@ def _get_reranker() -> Any:
 
 
 def _generate_hyde_query(query: str) -> str:
-    """Generate a hypothetical transcript excerpt for HyDE retrieval.
-
-    Sends the query to the vLLM server asking for a 1-2 sentence hypothetical
-    answer as if it were spoken in a meeting transcript. Returns the hypothetical
-    text to embed in place of the raw query.
-
-    Falls back to the original query string if the vLLM call fails.
-    """
-    from openai import APIConnectionError, APIStatusError
-    client = _build_openai_client()
+    """Generate a hypothetical transcript excerpt for HyDE retrieval."""
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
+        response = _chat_completion(
             messages=[
                 {
                     "role": "system",
@@ -112,12 +137,11 @@ def _generate_hyde_query(query: str) -> str:
             ],
             max_tokens=100,
             temperature=0.5,
-
         )
-        hypothetical = response.choices[0].message.content.strip()
+        hypothetical = _completion_text(response)
         logger.debug("HyDE hypothetical: %r", hypothetical)
         return hypothetical
-    except (APIConnectionError, APIStatusError) as e:
+    except RuntimeError as e:
         logger.warning("HyDE generation failed (%s) — falling back to direct query embedding", e)
         return query
 
@@ -128,22 +152,15 @@ def retrieve(
     embedding_model: SentenceTransformer,
     top_k: int = TOP_K_RESULTS,
 ) -> list[dict]:
-    """Embed query and return top-k chunks, with optional reranking.
+    """Embed query and return top-k chunks, with optional reranking."""
+    collection_name = getattr(collection, "name", "default")
+    cache_key = (collection_name, query)
+    if QUERY_CACHE_ENABLED and cache_key in _query_cache:
+        logger.info("query cache hit for %s", query)
+        return _query_cache[cache_key][:top_k]
 
-    Pipeline:
-      1. HyDE (if enabled): generate a hypothetical transcript excerpt and embed
-         that instead of the raw query to improve recall on vague questions.
-      2. ChromaDB ANN search: fetch `_RERANKER_FETCH_K` candidates (more than
-         top_k so the reranker has candidates to reorder).
-      3. Cross-encoder reranking (if enabled): re-score every (query, chunk) pair
-         and sort by reranker score.  Falls back to embedding-distance order if the
-         model failed to load.
-    """
-    # Step 1: optionally replace query with a hypothetical document for HyDE
     embed_text = _generate_hyde_query(query) if HYDE_ENABLED else query
     query_embedding = embedding_model.encode(embed_text).tolist()
-
-    # Step 2: fetch candidates — more than top_k when reranking is on
     fetch_k = max(_RERANKER_FETCH_K, top_k * 2) if RERANKER_ENABLED else top_k + 2
 
     try:
@@ -165,7 +182,6 @@ def retrieve(
             continue
         chunks.append({**meta, "text": doc, "distance": round(dist, 4)})
 
-    # Step 3: rerank if a cross-encoder is available
     reranker = _get_reranker()
     if reranker is not None and len(chunks) > top_k:
         try:
@@ -176,6 +192,8 @@ def retrieve(
         except Exception as e:
             logger.warning("reranking failed (%s) — using embedding-distance order", e)
 
+    if QUERY_CACHE_ENABLED:
+        _query_cache[cache_key] = chunks[:]
     return chunks[:top_k]
 
 
@@ -189,53 +207,35 @@ def _format_context(chunks: list[dict]) -> str:
 
 
 def generate_answer(query: str, chunks: list[dict]) -> str:
-    """Send query + retrieved context to vLLM and return the answer text."""
-    from openai import APIConnectionError, APIStatusError
-    client = _build_openai_client()
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Context:\n{_format_context(chunks)}\n\nQuestion: {query}",
-                },
-            ],
-            max_tokens=MAX_TOKENS,
-            temperature=0.1,
-
-        )
-    except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
-    except APIStatusError as e:
-        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
-    return response.choices[0].message.content.strip()
+    """Send query + retrieved context to Groq and return the answer text."""
+    response = _chat_completion(
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Context:\n{_format_context(chunks)}\n\nQuestion: {query}",
+            },
+        ],
+        max_tokens=MAX_TOKENS,
+        temperature=0.1,
+    )
+    return _completion_text(response)
 
 
 def generate_answer_stream(query: str, chunks: list[dict]) -> Iterator[str]:
-    """Stream answer tokens from vLLM. Yields text delta strings."""
-    from openai import APIConnectionError, APIStatusError
-    client = _build_openai_client()
-    try:
-        stream = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Context:\n{_format_context(chunks)}\n\nQuestion: {query}",
-                },
-            ],
-            max_tokens=MAX_TOKENS,
-            temperature=0.1,
-            stream=True,
-
-        )
-    except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
-    except APIStatusError as e:
-        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
+    """Stream answer tokens from Groq. Yields text delta strings."""
+    stream = _chat_completion(
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Context:\n{_format_context(chunks)}\n\nQuestion: {query}",
+            },
+        ],
+        max_tokens=MAX_TOKENS,
+        temperature=0.1,
+        stream=True,
+    )
     for chunk in stream:
         delta = chunk.choices[0].delta.content
         if delta:
@@ -243,39 +243,25 @@ def generate_answer_stream(query: str, chunks: list[dict]) -> Iterator[str]:
 
 
 def generate_summary(segments: list[dict]) -> str:
-    """Generate a summary of the full transcript using vLLM."""
-    from openai import APIConnectionError, APIStatusError
+    """Generate a summary of the full transcript using Groq."""
     raw = "\n".join(f"[{s['speaker']} | {s['start']:.1f}s]: {s['text']}" for s in segments)
     transcript = raw[:_SHOW_NOTES_CHAR_BUDGET]
-    client = _build_openai_client()
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            max_tokens=512,
-            temperature=0.3,
-
-        )
-    except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
-    except APIStatusError as e:
-        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
-    return response.choices[0].message.content.strip()
+    response = _chat_completion(
+        messages=[
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ],
+        max_tokens=512,
+        temperature=0.3,
+    )
+    return _completion_text(response)
 
 
 def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
-    """Scan the intro of the transcript to map speaker IDs to real names.
-
-    Returns e.g. {"0": "Lex Fridman", "1": "Elon Musk"}.
-    Falls back to {"0": "Speaker 0", ...} if names can't be extracted.
-    """
+    """Scan the intro of the transcript to map speaker IDs to real names."""
     speakers = sorted({s["speaker"] for s in segments})
 
     def _readable(spk: str) -> str:
-        # "SPEAKER_00" → "Speaker 1", "SPEAKER_01" → "Speaker 2", "0" → "Speaker 1"
         clean = spk.replace("SPEAKER_", "").lstrip("0") or "0"
         try:
             return f"Speaker {int(clean) + 1}"
@@ -283,15 +269,12 @@ def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
             return f"Speaker {spk}"
 
     fallback = {spk: _readable(spk) for spk in speakers}
-
     intro = segments[:25]
     text = "\n".join(f"[{s['speaker']}]: {s['text']}" for s in intro)
+    example_key = speakers[0] if speakers else "speaker"
 
-    from openai import APIConnectionError, APIStatusError
-    client = _build_openai_client()
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
+        response = _chat_completion(
             messages=[
                 {
                     "role": "system",
@@ -300,28 +283,24 @@ def resolve_speaker_names(segments: list[dict]) -> dict[str, str]:
                         "Extract the real name of each speaker ID ONLY if the speaker explicitly introduces themselves or is directly addressed by name in the transcript. "
                         "Do NOT infer or guess names from context, topics, or writing style. "
                         "If a name is not explicitly stated, return null for that speaker. "
-                        f"The speaker IDs are: {list(speakers)}. "
+                        f"The speaker IDs are: {speakers}. "
                         "Return only a JSON object mapping each exact speaker ID to their name or null, e.g. "
-                        f"{{\"{list(speakers)[0]}\": \"Name\"}}. Return only valid JSON, no other text."
+                        f"{{\"{example_key}\": \"Name\"}}. Return only valid JSON, no other text."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
             max_tokens=128,
             temperature=0.0,
-
         )
-    except (APIConnectionError, APIStatusError) as e:
+    except RuntimeError as e:
         logger.warning("speaker name resolution failed (%s) — using fallback labels", e)
         return fallback
-    raw = response.choices[0].message.content.strip()
+
+    raw = _completion_text(response)
     try:
         parsed = json.loads(raw)
-        # Replace nulls with fallback, ensure all speakers are covered
-        return {
-            spk: parsed.get(spk) or fallback[spk]
-            for spk in speakers
-        }
+        return {spk: parsed.get(spk) or fallback[spk] for spk in speakers}
     except (json.JSONDecodeError, KeyError):
         logger.warning("could not parse speaker name JSON: %r", raw)
         return fallback
@@ -350,12 +329,15 @@ def _sample_chunks(chunks: list[dict]) -> list[dict]:
 
     middle = [c for i, c in enumerate(chunks) if i not in anchor_ids]
     sampled_middle: list[dict] = []
+    sampled_chars = 0
     if middle and budget_left > 0:
-        step = max(1, len(middle) // (budget_left // 300))
+        step = max(1, len(middle) // max(1, budget_left // 300))
         for i in range(0, len(middle), step):
-            if _chars(sampled_middle) + len(middle[i]["text"]) > budget_left:
+            chunk_chars = len(middle[i]["text"])
+            if sampled_chars + chunk_chars > budget_left:
                 break
             sampled_middle.append(middle[i])
+            sampled_chars += chunk_chars
 
     combined = sorted(anchors + sampled_middle, key=lambda c: c["start"])
     return combined
@@ -363,28 +345,19 @@ def _sample_chunks(chunks: list[dict]) -> list[dict]:
 
 def generate_show_notes(chunks: list[dict]) -> dict:
     """Generate timestamped chapters, key quotes, and takeaways from transcript chunks."""
-    from openai import APIConnectionError, APIStatusError
     sampled = _sample_chunks(chunks)
     transcript = "\n\n".join(
         f"[{c['start']:.1f}s–{c['end']:.1f}s | {c['speaker']}]\n{c['text']}" for c in sampled
     )
-    client = _build_openai_client()
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _SHOW_NOTES_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            max_tokens=1024,
-            temperature=0.2,
-
-        )
-    except APIConnectionError as e:
-        raise RuntimeError(f"Cannot reach Groq API. Check your GROQ_API_KEY and network connection.") from e
-    except APIStatusError as e:
-        raise RuntimeError(f"Groq API error: {e.status_code} — {e.message}") from e
-    raw = response.choices[0].message.content.strip()
+    response = _chat_completion(
+        messages=[
+            {"role": "system", "content": _SHOW_NOTES_PROMPT},
+            {"role": "user", "content": transcript},
+        ],
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    raw = _completion_text(response)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:

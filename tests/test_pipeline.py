@@ -225,6 +225,7 @@ def test_config_all_env_vars_have_defaults():
         assert config.LLM_MODEL        is not None
         assert config.MAX_TOKENS       is not None
         assert config.TOP_K_RESULTS    is not None
+        assert config.QUERY_CACHE_ENABLED is not None
         assert config.VIBEVOICE_VLLM_URL is not None
         assert config.CHUNK_MAX_CHARS  is not None
         assert config.RERANKER_MODEL   is not None

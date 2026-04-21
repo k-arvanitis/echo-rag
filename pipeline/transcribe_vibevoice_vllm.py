@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ _NON_SPEECH = re.compile(
 # VibeVoice tokenizes at ~12.5 tokens/sec; 65536-token context ≈ 87 min.
 # Use 45-min chunks to stay safely within context.
 _CHUNK_SECONDS = 45 * 60
+_MAX_TRANSCRIBE_WORKERS = 2
 
 _MIME_MAP = {
     ".wav": "audio/wav",
@@ -64,8 +66,7 @@ def _audio_to_b64(audio_path: str) -> tuple[str, str]:
     ext = os.path.splitext(audio_path)[1].lower()
     mime = _MIME_MAP.get(ext, "audio/wav")
     with open(audio_path, "rb") as f:
-        data = f.read()
-    return base64.b64encode(data).decode(), mime
+        return base64.b64encode(f.read()).decode(), mime
 
 
 def _call_api(audio_path: str, duration: float) -> list[dict]:
@@ -182,21 +183,50 @@ def _parse_segments(raw: list[dict], time_offset: float = 0.0) -> list[dict]:
     return segments
 
 
+def _transcribe_chunk(chunk_path: str, chunk_duration: float, time_offset: float, index: int, total: int) -> list[dict]:
+    logger.info("chunk %d/%d at %.1f min", index, total, time_offset / 60)
+    try:
+        t0 = time.time()
+        raw = _call_api(chunk_path, chunk_duration)
+        logger.info("chunk %d/%d done in %.1fs", index, total, time.time() - t0)
+        return _parse_segments(raw, time_offset=time_offset)
+    finally:
+        os.unlink(chunk_path)
+
+
+
+def _iter_audio_chunks(audio_path: str, chunk_seconds: int) -> tuple[int, list[tuple[str, float, float]]]:
+    with sf.SoundFile(audio_path) as audio_file:
+        sr = audio_file.samplerate
+        channels = audio_file.channels
+        chunk_frames = int(chunk_seconds * sr)
+        total_frames = len(audio_file)
+        chunk_specs: list[tuple[str, float, float]] = []
+
+        for offset_frames in range(0, total_frames, chunk_frames):
+            frames_to_read = min(chunk_frames, total_frames - offset_frames)
+            chunk = audio_file.read(frames=frames_to_read, dtype="float32", always_2d=channels > 1)
+            if channels > 1:
+                chunk = chunk.mean(axis=1)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                sf.write(tmp.name, chunk, sr)
+                chunk_specs.append((tmp.name, frames_to_read / sr, offset_frames / sr))
+
+    return len(chunk_specs), chunk_specs
+
+
+
 def transcribe(
     audio_path: str,
     stt_model: Any = None,
 ) -> list[dict]:
-    """Transcribe audio via VibeVoice vLLM API.
-
-    Sends the audio file directly (server handles resampling via FFmpeg).
-    Chunks into 45-min segments for recordings longer than the context window.
-    Returns [{speaker, start, end, text}].
-    """
+    """Transcribe audio via VibeVoice vLLM API."""
     try:
         duration = _get_duration(audio_path)
     except Exception:
-        audio_tmp, sr_tmp = sf.read(audio_path)
-        duration = len(audio_tmp) / sr_tmp
+        with sf.SoundFile(audio_path) as audio_file:
+            duration = len(audio_file) / audio_file.samplerate
 
     if duration <= _CHUNK_SECONDS:
         t0 = time.time()
@@ -204,32 +234,16 @@ def transcribe(
         logger.info("VibeVoice vLLM done in %.1fs", time.time() - t0)
         return _parse_segments(raw)
 
-    # Long audio: load, split into chunks, transcribe each
-    audio, sr = sf.read(audio_path)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+    total_chunks, chunk_specs = _iter_audio_chunks(audio_path, _CHUNK_SECONDS)
+    logger.info("audio is %.1f min — splitting into %d chunks", duration / 60, total_chunks)
 
-    chunk_samples = int(_CHUNK_SECONDS * sr)
-    offsets = list(range(0, len(audio), chunk_samples))
-    logger.info("audio is %.1f min — splitting into %d chunks", duration / 60, len(offsets))
+    with ThreadPoolExecutor(max_workers=min(_MAX_TRANSCRIBE_WORKERS, total_chunks)) as executor:
+        futures = [
+            executor.submit(_transcribe_chunk, chunk_path, chunk_duration, time_offset, i + 1, total_chunks)
+            for i, (chunk_path, chunk_duration, time_offset) in enumerate(chunk_specs)
+        ]
 
     all_segments: list[dict] = []
-    for i, offset in enumerate(offsets):
-        chunk = audio[offset: offset + chunk_samples]
-        chunk_duration = len(chunk) / sr
-        time_offset = offset / sr
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, chunk, sr)
-            chunk_path = tmp.name
-
-        logger.info("chunk %d/%d at %.1f min", i + 1, len(offsets), time_offset / 60)
-        try:
-            t0 = time.time()
-            raw = _call_api(chunk_path, chunk_duration)
-            logger.info("chunk done in %.1fs", time.time() - t0)
-            all_segments.extend(_parse_segments(raw, time_offset=time_offset))
-        finally:
-            os.unlink(chunk_path)
-
+    for future in futures:
+        all_segments.extend(future.result())
     return all_segments
